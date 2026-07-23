@@ -33,6 +33,7 @@ import { initTts, cleanupTts } from "./modules/tts/tts.js";
 import { initEnaPlanner, cleanupEnaPlanner } from "./modules/ena-planner/ena-planner.js";
 import { initAssistant, cleanupAssistant } from "./modules/assistant/assistant.js";
 import { initEbook, cleanupEbook } from "./modules/ebook/ebook.js";
+import { initIdbBackendSync } from "./core/idb-backend-sync.js";
 
 extension_settings[EXT_ID] = extension_settings[EXT_ID] || {
     enabled: true,
@@ -779,7 +780,8 @@ async function toggleAllFeatures(enabled) {
             { condition: true, init: initEbook },
             { condition: true, init: () => { void initTavernSafely(); } },
             { condition: true, init: initStreamingGeneration },
-            { condition: true, init: initButtonCollapse }
+            { condition: true, init: initButtonCollapse },
+            { condition: true, init: () => { void initIdbBackendSync().catch(() => {}); } }
         ];
         moduleInits.forEach(({ condition, init }) => {
             if (condition) init();
