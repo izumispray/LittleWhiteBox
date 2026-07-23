@@ -71,6 +71,14 @@ export function getVectorDataFilename(chatId) {
     return slug ? `LWB_VectorData_${slug}_${hash}.zip` : `LWB_VectorData_${hash}.zip`;
 }
 
+// 版本 meta 小文件：加载时先比对它，避免每次下载整个 zip
+export function getVectorMetaFilename(chatId) {
+    const key = String(chatId || '');
+    const slug = key.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40);
+    const hash = hash36(key);
+    return slug ? `LWB_VectorMeta_${slug}_${hash}.json` : `LWB_VectorMeta_${hash}.json`;
+}
+
 function uint8ToBase64(uint8) {
     const CHUNK = 0x8000;
     let result = '';
@@ -95,6 +103,116 @@ function concatVectorBuffers(buffers) {
 function sliceVectorBuffer(bytes, floatOffset, dims) {
     const start = bytes.byteOffset + floatOffset * 4;
     return bytes.buffer.slice(start, start + dims * 4);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 本地读缓存（IndexedDB，只存与后端相同的 zip 字节，可随时清空）
+// 数据源永远在后端；缓存比服务器新 = 上次上传没完成，加载后补传。
+// ═══════════════════════════════════════════════════════════════════════════
+
+const CACHE_DB_NAME = 'LWB_VectorCache';
+const CACHE_STORE = 'zips';
+const CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
+let cacheDbPromise = null;
+let cachePruned = false;
+
+function openCacheDb() {
+    if (typeof indexedDB === 'undefined' || persistence.mode === 'memory') {
+        return Promise.resolve(null);
+    }
+    if (!cacheDbPromise) {
+        cacheDbPromise = new Promise((resolve) => {
+            try {
+                const req = indexedDB.open(CACHE_DB_NAME, 1);
+                req.onupgradeneeded = () => {
+                    const db = req.result;
+                    if (!db.objectStoreNames.contains(CACHE_STORE)) {
+                        db.createObjectStore(CACHE_STORE, { keyPath: 'chatId' });
+                    }
+                };
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => resolve(null);
+                req.onblocked = () => resolve(null);
+            } catch {
+                resolve(null);
+            }
+        });
+    }
+    return cacheDbPromise;
+}
+
+async function cacheGet(chatId) {
+    const db = await openCacheDb();
+    if (!db) return null;
+    return new Promise((resolve) => {
+        try {
+            const req = db.transaction(CACHE_STORE, 'readonly').objectStore(CACHE_STORE).get(chatId);
+            req.onsuccess = () => resolve(req.result || null);
+            req.onerror = () => resolve(null);
+        } catch {
+            resolve(null);
+        }
+    });
+}
+
+async function cachePut(record) {
+    const db = await openCacheDb();
+    if (!db) return;
+    await new Promise((resolve) => {
+        try {
+            const tx = db.transaction(CACHE_STORE, 'readwrite');
+            tx.objectStore(CACHE_STORE).put(record);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => resolve();
+            tx.onabort = () => resolve();
+        } catch {
+            resolve();
+        }
+    });
+}
+
+async function cacheDelete(chatId) {
+    const db = await openCacheDb();
+    if (!db) return;
+    await new Promise((resolve) => {
+        try {
+            const tx = db.transaction(CACHE_STORE, 'readwrite');
+            tx.objectStore(CACHE_STORE).delete(chatId);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => resolve();
+            tx.onabort = () => resolve();
+        } catch {
+            resolve();
+        }
+    });
+}
+
+function touchCacheEntry(record) {
+    cachePut({ ...record, lastAccessAt: Date.now() });
+}
+
+// 每个会话最多清理一次：删掉 30 天没访问的缓存条目
+function schedulePruneCacheOnce() {
+    if (cachePruned) return;
+    cachePruned = true;
+    setTimeout(async () => {
+        const db = await openCacheDb();
+        if (!db) return;
+        try {
+            const tx = db.transaction(CACHE_STORE, 'readwrite');
+            const store = tx.objectStore(CACHE_STORE);
+            const cutoff = Date.now() - CACHE_MAX_AGE_MS;
+            const req = store.openCursor();
+            req.onsuccess = () => {
+                const cursor = req.result;
+                if (!cursor) return;
+                const rec = cursor.value;
+                if ((rec?.lastAccessAt || 0) < cutoff) cursor.delete();
+                cursor.continue();
+            };
+        } catch { /* 清理失败无所谓 */ }
+    }, 30 * 1000);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -150,11 +268,16 @@ export async function ensureDataset(chatId) {
 
     ds.loading = (async () => {
         try {
-            const restored = await loadFromServer(key);
-            if (restored) {
-                applySerializedData(ds, restored);
+            const loaded = await loadDatasetWithCache(key);
+            if (loaded) {
+                applySerializedData(ds, loaded.parsed);
                 ds.serverFileExists = true;
-                xbLog.info(MODULE_ID, `已从服务器加载向量数据: chat=${key} chunks=${ds.chunks.size} l1v=${ds.chunkVectors.size} l2v=${ds.eventVectors.size} l0v=${ds.stateVectors.size}`);
+                if (loaded.needsReupload) {
+                    // 缓存领先于服务器（上次上传没完成）：补传
+                    ds.dirtyVersion++;
+                    markDatasetDirty(key);
+                }
+                xbLog.info(MODULE_ID, `已加载向量数据(${loaded.source}): chat=${key} chunks=${ds.chunks.size} l1v=${ds.chunkVectors.size} l2v=${ds.eventVectors.size} l0v=${ds.stateVectors.size}`);
             } else {
                 await migrateFromLegacyIndexedDb(ds);
             }
@@ -252,17 +375,20 @@ export async function deleteDatasetEverywhere(chatId) {
         datasets.delete(key);
     }
 
+    await cacheDelete(key);
+
     const headers = await resolveRequestHeaders();
     if (!headers) return;
     try {
-        const filename = getVectorDataFilename(key);
-        const res = await fetch('/api/files/delete', {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({ path: `user/files/${filename}` }),
-        });
-        if (res.ok) {
-            xbLog.info(MODULE_ID, `已删除服务器向量数据: ${filename}`);
+        for (const filename of [getVectorDataFilename(key), getVectorMetaFilename(key)]) {
+            const res = await fetch('/api/files/delete', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ path: `user/files/${filename}` }),
+            });
+            if (res.ok) {
+                xbLog.info(MODULE_ID, `已删除服务器向量数据: ${filename}`);
+            }
         }
     } catch (e) {
         xbLog.warn(MODULE_ID, `删除服务器向量数据失败: chat=${key} err=${e?.message || e}`);
@@ -312,17 +438,20 @@ function serializeDataset(ds) {
         stateVectorCount: ds.stateVectors.size,
     };
 
-    return zipSync({
-        'manifest.json': strToU8(JSON.stringify(manifest)),
-        'chunks.json': strToU8(JSON.stringify([...ds.chunks.values()])),
-        'chunk_vectors.jsonl': strToU8(chunkVecs.jsonl),
-        'chunk_vectors.bin': chunkVecs.bin,
-        'event_vectors.jsonl': strToU8(eventVecs.jsonl),
-        'event_vectors.bin': eventVecs.bin,
-        'state_vectors.jsonl': strToU8(stateVecs.jsonl),
-        'state_vectors.bin': stateVecs.bin,
-        'state_r_vectors.bin': stateRBin,
-    }, { level: 1 });
+    return {
+        zipData: zipSync({
+            'manifest.json': strToU8(JSON.stringify(manifest)),
+            'chunks.json': strToU8(JSON.stringify([...ds.chunks.values()])),
+            'chunk_vectors.jsonl': strToU8(chunkVecs.jsonl),
+            'chunk_vectors.bin': chunkVecs.bin,
+            'event_vectors.jsonl': strToU8(eventVecs.jsonl),
+            'event_vectors.bin': eventVecs.bin,
+            'state_vectors.jsonl': strToU8(stateVecs.jsonl),
+            'state_vectors.bin': stateVecs.bin,
+            'state_r_vectors.bin': stateRBin,
+        }, { level: 1 }),
+        savedAt: manifest.savedAt,
+    };
 }
 
 function parseJsonl(unzipped, name) {
@@ -389,34 +518,43 @@ function applySerializedData(ds, parsed) {
 // 服务器读写
 // ═══════════════════════════════════════════════════════════════════════════
 
-async function loadFromServer(chatId) {
-    const headers = await resolveRequestHeaders();
-    if (!headers) return null;
-
-    const filename = getVectorDataFilename(chatId);
-    let res;
+async function fetchServerVectorMeta(chatId, headers) {
     try {
-        res = await fetch(`/user/files/${filename}`, { headers, cache: 'no-cache' });
+        const res = await fetch(`/user/files/${getVectorMetaFilename(chatId)}`, { headers, cache: 'no-cache' });
+        if (!res.ok) return null;
+        const json = await res.json();
+        return Number.isFinite(json?.v) ? json : null;
     } catch {
         return null;
     }
-    if (!res.ok) return null;
+}
 
-    const arrayBuffer = await res.arrayBuffer();
-    if (!arrayBuffer || arrayBuffer.byteLength === 0) return null;
+async function fetchServerZip(chatId, headers) {
+    try {
+        const res = await fetch(`/user/files/${getVectorDataFilename(chatId)}`, { headers, cache: 'no-cache' });
+        if (!res.ok) return null;
+        const arrayBuffer = await res.arrayBuffer();
+        if (!arrayBuffer?.byteLength) return null;
+        return new Uint8Array(arrayBuffer);
+    } catch {
+        return null;
+    }
+}
 
+function parseZipBytes(chatId, bytes) {
+    const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
     let unzipped;
     try {
-        unzipped = unzipSync(new Uint8Array(arrayBuffer));
+        unzipped = unzipSync(u8);
     } catch {
-        xbLog.warn(MODULE_ID, `服务器向量数据无法解压，忽略: ${filename}`);
+        xbLog.warn(MODULE_ID, `向量数据无法解压，忽略: chat=${chatId}`);
         return null;
     }
     if (!unzipped['manifest.json']) return null;
 
     const manifest = JSON.parse(strFromU8(unzipped['manifest.json']));
     if (manifest.version !== FORMAT_VERSION) {
-        xbLog.warn(MODULE_ID, `不支持的向量数据版本 ${manifest.version}，忽略: ${filename}`);
+        xbLog.warn(MODULE_ID, `不支持的向量数据版本 ${manifest.version}，忽略: chat=${chatId}`);
         return null;
     }
     if (manifest.chatId !== chatId) {
@@ -433,6 +571,65 @@ async function loadFromServer(chatId) {
         stateVectors: deserializeVectorTable(unzipped, 'state_vectors.jsonl', 'state_vectors.bin'),
         stateRBytes: unzipped['state_r_vectors.bin'] || new Uint8Array(0),
     };
+}
+
+/**
+ * 加载顺序：
+ * 1. 缓存与服务器版本一致 → 用缓存（省下载）
+ * 2. 缓存比服务器新 → 用缓存 + 标记补传（上次上传没完成）
+ * 3. 其余 → 下载服务器 zip 并写缓存
+ * 4. 服务器丢了但缓存还在 → 用缓存 + 补传（兜底）
+ */
+async function loadDatasetWithCache(chatId) {
+    const headers = await resolveRequestHeaders();
+    if (!headers) return null;
+
+    schedulePruneCacheOnce();
+
+    const [serverMeta, cached] = await Promise.all([
+        fetchServerVectorMeta(chatId, headers),
+        cacheGet(chatId),
+    ]);
+
+    if (cached?.bytes && serverMeta && cached.savedAt === serverMeta.v) {
+        const parsed = parseZipBytes(chatId, cached.bytes);
+        if (parsed) {
+            touchCacheEntry(cached);
+            return { parsed, source: 'cache', needsReupload: false };
+        }
+    }
+
+    if (cached?.bytes && (!serverMeta || cached.savedAt > serverMeta.v)) {
+        const parsed = parseZipBytes(chatId, cached.bytes);
+        if (parsed) {
+            touchCacheEntry(cached);
+            return { parsed, source: 'cache-ahead', needsReupload: true };
+        }
+    }
+
+    const bytes = await fetchServerZip(chatId, headers);
+    if (bytes) {
+        const parsed = parseZipBytes(chatId, bytes);
+        if (parsed) {
+            cachePut({
+                chatId,
+                savedAt: Number(parsed.manifest.savedAt) || 0,
+                lastAccessAt: Date.now(),
+                bytes,
+            });
+            return { parsed, source: 'server', needsReupload: false };
+        }
+    }
+
+    if (cached?.bytes) {
+        const parsed = parseZipBytes(chatId, cached.bytes);
+        if (parsed) {
+            touchCacheEntry(cached);
+            return { parsed, source: 'cache-fallback', needsReupload: true };
+        }
+    }
+
+    return null;
 }
 
 async function saveDataset(ds, { silent = true, keepaliveHint = false } = {}) {
@@ -461,7 +658,10 @@ async function saveDataset(ds, { silent = true, keepaliveHint = false } = {}) {
     const versionToSave = ds.dirtyVersion;
 
     try {
-        const zipData = serializeDataset(ds);
+        const { zipData, savedAt } = serializeDataset(ds);
+        // 先写本地缓存：页面在上传完成前被杀时，下次启动可从缓存补传
+        await cachePut({ chatId: ds.chatId, savedAt, lastAccessAt: Date.now(), bytes: zipData });
+
         const body = JSON.stringify({
             name: getVectorDataFilename(ds.chatId),
             data: uint8ToBase64(zipData),
@@ -482,6 +682,21 @@ async function saveDataset(ds, { silent = true, keepaliveHint = false } = {}) {
             clearTimeout(timeoutId);
         }
         if (!res.ok) throw new Error(`服务器返回 ${res.status}`);
+
+        // 版本 meta 小文件（供下次加载做廉价比对；失败可容忍，缓存领先会自愈补传）
+        try {
+            const metaRes = await fetch('/api/files/upload', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    name: getVectorMetaFilename(ds.chatId),
+                    data: uint8ToBase64(strToU8(JSON.stringify({ v: savedAt }))),
+                }),
+            });
+            if (!metaRes.ok) xbLog.warn(MODULE_ID, `版本 meta 上传失败(${metaRes.status}): chat=${ds.chatId}`);
+        } catch (e) {
+            xbLog.warn(MODULE_ID, `版本 meta 上传失败: chat=${ds.chatId} err=${e?.message || e}`);
+        }
 
         ds.savedVersion = Math.max(ds.savedVersion, versionToSave);
         ds.serverFileExists = true;
