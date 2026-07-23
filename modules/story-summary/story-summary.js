@@ -109,6 +109,7 @@ import {
 
 // vector io
 import { exportVectors, importVectors, backupToServer, restoreFromServer, fetchManifest, deleteServerBackup, isDeleteUnsupportedError, getBackupFilename } from "./vector/storage/vector-io.js";
+import { retainDatasets, deleteDatasetEverywhere } from "./data/vector-store.js";
 import {
     clearRecallRuntime,
     getRecallRuntimeStats,
@@ -2747,6 +2748,10 @@ async function handleChatChanged() {
     activeChatId = getContext().chatId || null;
     logRecallRuntimeCheckpoint("chatChanged:before-retain", `chat=${activeChatId || "-"} length=${Array.isArray(chat) ? chat.length : 0}`);
     await retainRecallRuntimeOnly(activeChatId);
+    // 落盘并逐出其它聊天的向量数据集（存后端，不留浏览器）
+    retainDatasets(activeChatId).catch((error) => {
+        xbLog.warn(MODULE_ID, `向量数据集收缩失败: ${error?.message || error}`);
+    });
     const newLength = Array.isArray(chat) ? chat.length : 0;
 
     await rollbackSummaryIfNeeded();
@@ -3178,6 +3183,8 @@ function unregisterEvents() {
 async function handleChatDeleted(chatId) {
     logRecallRuntimeCheckpoint("chatDeleted:clear-runtime", `chat=${chatId || "-"}`);
     await clearRecallRuntime(chatId);
+    // 清理服务器上的向量数据文件
+    await deleteDatasetEverywhere(chatId).catch(() => {});
     try {
         const filename = getBackupFilename(chatId);
         await deleteServerBackup(filename, null);

@@ -1572,10 +1572,10 @@
     },
     {
       "source": "littlewhitebox",
-      "publicPath": "scripts/extensions/third-party/LittleWhiteBox/modules/story-summary/data/db.js",
-      "relativePath": "modules/story-summary/data/db.js",
+      "publicPath": "scripts/extensions/third-party/LittleWhiteBox/modules/story-summary/data/vector-store.js",
+      "relativePath": "modules/story-summary/data/vector-store.js",
       "extension": ".js",
-      "sizeBytes": 772
+      "sizeBytes": 24165
     },
     {
       "source": "littlewhitebox",

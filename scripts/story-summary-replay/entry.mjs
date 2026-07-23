@@ -1106,12 +1106,13 @@ export async function runStorySummaryReplay({ rootDir, config, configPath }) {
     globalThis.window.xiaobaixStreamingGeneration = createStreamingGenerationShim(panelConfig.api);
 
     const modules = await (async () => {
-        const [{ EXT_ID }, configModule, storeModule, generatorModule, promptModule, chunkStoreModule, chunkBuilderModule, stateStoreModule, stateIntegrationModule, recallModule, metricsModule, embedderModule] = await Promise.all([
+        const [{ EXT_ID }, configModule, storeModule, generatorModule, promptModule, vectorStoreModule, chunkStoreModule, chunkBuilderModule, stateStoreModule, stateIntegrationModule, recallModule, metricsModule, embedderModule] = await Promise.all([
             import('../../core/constants.js'),
             import('../../modules/story-summary/data/config.js'),
             import('../../modules/story-summary/data/store.js'),
             import('../../modules/story-summary/generate/generator.js'),
             import('../../modules/story-summary/generate/prompt.js'),
+            import('../../modules/story-summary/data/vector-store.js'),
             import('../../modules/story-summary/vector/storage/chunk-store.js'),
             import('../../modules/story-summary/vector/pipeline/chunk-builder.js'),
             import('../../modules/story-summary/vector/storage/state-store.js'),
@@ -1120,6 +1121,9 @@ export async function runStorySummaryReplay({ rootDir, config, configPath }) {
             import('../../modules/story-summary/vector/retrieval/metrics.js'),
             import('../../modules/story-summary/vector/utils/embedder.js'),
         ]);
+
+        // Node replay 环境没有酒馆后端，向量存储走内存模式
+        vectorStoreModule.configureVectorStorePersistence({ mode: 'memory' });
 
         extSettings[EXT_ID] = { storySummary: { enabled: true } };
 

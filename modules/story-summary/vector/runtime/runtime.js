@@ -3,14 +3,11 @@
 // Browser path: a module Worker owns hot L0/L1/L2 vector data and scoring.
 // Emergency path: a private main-thread backend with the same API. This is
 // intentionally contained here so business modules do not depend on cache maps.
+//
+// Data source: the main-thread vector-store (backend-persisted). The worker
+// never touches storage itself — beginSession/refresh calls carry a snapshot.
 
-import {
-    metaTable,
-    chunksTable,
-    chunkVectorsTable,
-    eventVectorsTable,
-    stateVectorsTable,
-} from '../../data/db.js';
+import { getDatasetSnapshot } from '../../data/vector-store.js';
 import { xbLog } from '../../../../core/debug-core.js';
 import { createWorkerRpc } from './rpc.js';
 import {
@@ -194,7 +191,13 @@ async function createWorkerBackend() {
     return {
         kind: 'worker',
         async call(type, payload, options = {}) {
-            return await rpc.call(type, payload, {
+            let finalPayload = payload;
+            // worker 不接触存储：会话/刷新请求由主线程附带数据快照
+            if ((type === 'beginSession' || type === 'refresh') && payload?.chatId) {
+                const dataset = await getDatasetSnapshot(payload.chatId);
+                finalPayload = { ...payload, dataset };
+            }
+            return await rpc.call(type, finalPayload, {
                 timeoutMs: options.timeoutMs || WORKER_TIMEOUT_MS,
             });
         },
@@ -387,19 +390,7 @@ function createMainBackend() {
 
         entry.warming = (async () => {
             const loadStarted = performance.now();
-            const [
-                meta,
-                chunks,
-                chunkVectors,
-                eventVectors,
-                stateVectors,
-            ] = await Promise.all([
-                metaTable.get(entry.chatId),
-                chunksTable.where('chatId').equals(entry.chatId).toArray(),
-                chunkVectorsTable.where('chatId').equals(entry.chatId).toArray(),
-                eventVectorsTable.where('chatId').equals(entry.chatId).toArray(),
-                stateVectorsTable.where('chatId').equals(entry.chatId).toArray(),
-            ]);
+            const snapshot = await getDatasetSnapshot(entry.chatId);
             const loadFromDBMs = Math.round(performance.now() - loadStarted);
 
             if (entry.version !== startedVersion) {
@@ -412,11 +403,11 @@ function createMainBackend() {
             const next = createEntry(entry.chatId);
             next.version = entry.version;
             const buildStarted = performance.now();
-            next.meta = meta || null;
-            upsertChunks(next, chunks);
-            upsertChunkVectors(next, chunkVectors);
-            upsertEventVectors(next, eventVectors);
-            upsertStateVectors(next, stateVectors);
+            next.meta = snapshot.meta || null;
+            upsertChunks(next, snapshot.chunks);
+            upsertChunkVectors(next, snapshot.chunkVectors);
+            upsertEventVectors(next, snapshot.eventVectors);
+            upsertStateVectors(next, snapshot.stateVectors);
             const buildEntryMs = Math.round(performance.now() - buildStarted);
             next.ready = true;
             next.status = 'ready';

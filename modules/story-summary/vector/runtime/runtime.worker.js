@@ -1,10 +1,6 @@
-import {
-    metaTable,
-    chunksTable,
-    chunkVectorsTable,
-    eventVectorsTable,
-    stateVectorsTable,
-} from '../../data/db.js';
+// Recall runtime worker: pure compute cache. It never touches storage —
+// the main thread feeds it data snapshots along with beginSession/refresh.
+
 import {
     scoreAnchorsFromStateVectors,
     scoreEventsFromEventVectors,
@@ -111,6 +107,14 @@ function createEntry(chatId) {
 
 const entries = new Map();
 const sessionsByChatId = new Map();
+// 主线程随 beginSession/refresh 送来的数据快照，refresh 时消费
+const pendingDatasets = new Map();
+
+function stashDataset(chatId, dataset) {
+    const key = normalizeChatId(chatId);
+    if (!key || !dataset) return;
+    pendingDatasets.set(key, dataset);
+}
 
 function createIdleStats(chatId, overrides = {}) {
     return {
@@ -318,19 +322,16 @@ async function refresh(chatId, reason = 'manual') {
 
     entry.warming = (async () => {
         const loadStarted = performance.now();
-        const [
-            meta,
-            chunks,
-            chunkVectors,
-            eventVectors,
-            stateVectors,
-        ] = await Promise.all([
-            metaTable.get(entry.chatId),
-            chunksTable.where('chatId').equals(entry.chatId).toArray(),
-            chunkVectorsTable.where('chatId').equals(entry.chatId).toArray(),
-            eventVectorsTable.where('chatId').equals(entry.chatId).toArray(),
-            stateVectorsTable.where('chatId').equals(entry.chatId).toArray(),
-        ]);
+        const dataset = pendingDatasets.get(entry.chatId) || null;
+        pendingDatasets.delete(entry.chatId);
+        if (!dataset) {
+            logWarn('refresh without dataset snapshot, building empty entry', `chat=${entry.chatId} reason=${reason}`);
+        }
+        const meta = dataset?.meta || null;
+        const chunks = dataset?.chunks || [];
+        const chunkVectors = dataset?.chunkVectors || [];
+        const eventVectors = dataset?.eventVectors || [];
+        const stateVectors = dataset?.stateVectors || [];
         const loadFromDBMs = Math.round(performance.now() - loadStarted);
 
         if (entry.version !== startedVersion) {
@@ -435,6 +436,7 @@ function endSession(lease = {}) {
     if (!session.count || !session.leases.size) {
         sessionsByChatId.delete(key);
         entries.delete(key);
+        pendingDatasets.delete(key);
         const endSessionClearMs = Math.round(performance.now() - startedAt);
         logInfo('end session cleared', `chat=${key} lease=${leaseId} clear=${endSessionClearMs}ms`);
         return createIdleStats(key, { endSessionClearMs });
@@ -533,10 +535,12 @@ async function handle(type, payload = {}) {
         case 'ping':
             return { pong: true, backend: 'worker' };
         case 'beginSession':
+            stashDataset(payload.chatId, payload.dataset);
             return await beginSession(payload.chatId, payload.reason);
         case 'endSession':
             return endSession(payload.lease);
         case 'refresh':
+            stashDataset(payload.chatId, payload.dataset);
             return await refresh(payload.chatId, payload.reason);
         case 'applyMutation':
             return applyMutation(payload.chatId, payload.mutation);
@@ -547,6 +551,12 @@ async function handle(type, payload = {}) {
                 if (keep && key === keep) continue;
                 if (sessionsByChatId.get(key)?.leases?.size) continue;
                 entries.delete(key);
+                pendingDatasets.delete(key);
+            }
+            for (const key of [...pendingDatasets.keys()]) {
+                if (keep && key === keep) continue;
+                if (sessionsByChatId.get(key)?.leases?.size) continue;
+                pendingDatasets.delete(key);
             }
             return [...entries.values()].map(entryStats);
         }
@@ -557,12 +567,14 @@ async function handle(type, payload = {}) {
                 if (!sessionsByChatId.get(key)?.leases?.size) {
                     const entry = getEntry(payload.chatId);
                     clearDomain(entry, payload.domain || 'all');
+                    if ((payload.domain || 'all') === 'all') pendingDatasets.delete(key);
                     logInfo('clear result', compactStats(entryStats(entry)));
                 }
             } else {
                 for (const key of [...entries.keys()]) {
                     if (sessionsByChatId.get(key)?.leases?.size) continue;
                     entries.delete(key);
+                    pendingDatasets.delete(key);
                 }
                 logInfo('clear result', 'all entries removed');
             }

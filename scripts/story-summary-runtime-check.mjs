@@ -4,8 +4,6 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import 'fake-indexeddb/auto';
-
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const chatId = `runtime-check-${Date.now()}`;
 
@@ -44,22 +42,21 @@ async function assertNoBusinessVectorCacheImports() {
 
 async function main() {
     const [
-        dbModule,
+        storeModule,
         runtimeModule,
         scoringModule,
     ] = await Promise.all([
-        import('../modules/story-summary/data/db.js'),
+        import('../modules/story-summary/data/vector-store.js'),
         import('../modules/story-summary/vector/runtime/runtime.js'),
         import('../modules/story-summary/vector/runtime/scoring.js'),
     ]);
 
     const {
-        metaTable,
-        chunksTable,
-        chunkVectorsTable,
-        eventVectorsTable,
-        stateVectorsTable,
-    } = dbModule;
+        configureVectorStorePersistence,
+        ensureDataset,
+        markDatasetDirty,
+    } = storeModule;
+    configureVectorStorePersistence({ mode: 'memory' });
     const {
         beginRecallRuntimeSession,
         endRecallRuntimeSession,
@@ -92,13 +89,15 @@ async function main() {
         { chatId, atomId: 'atom-1', floor: 1, vector: float32ToBuffer([1, 0]), rVector: float32ToBuffer([1, 0]), dims: 2, rDims: 2, fingerprint: 'runtime-check' },
     ];
 
-    await Promise.all([
-        metaTable.put({ chatId, fingerprint: 'runtime-check', lastChunkFloor: 2, updatedAt: Date.now() }),
-        chunksTable.bulkPut(chunks),
-        chunkVectorsTable.bulkPut(chunkVectors),
-        eventVectorsTable.bulkPut(eventVectors),
-        stateVectorsTable.bulkPut(stateVectors),
-    ]);
+    await (async () => {
+        const ds = await ensureDataset(chatId);
+        ds.meta = { chatId, fingerprint: 'runtime-check', lastChunkFloor: 2, updatedAt: Date.now() };
+        for (const chunk of chunks) ds.chunks.set(chunk.chunkId, chunk);
+        for (const rec of chunkVectors) ds.chunkVectors.set(rec.chunkId, rec);
+        for (const rec of eventVectors) ds.eventVectors.set(rec.eventId, rec);
+        for (const rec of stateVectors) ds.stateVectors.set(rec.atomId, rec);
+        markDatasetDirty(chatId);
+    })();
 
     const warm = await warmRecallRuntime(chatId, { reason: 'runtime-check' });
     const warmStats = getRecallRuntimeStats().find((item) => item.chatId === chatId) || getRecallRuntimeStats()[0] || {};

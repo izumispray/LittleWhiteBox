@@ -1,13 +1,13 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // Story Summary - State Store (L0)
 // StateAtom 存 chat_metadata（持久化）
-// StateVector 存 IndexedDB（可重建）
+// StateVector 存后端 vector-store（可重建）
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { getContext, saveMetadataDebounced } from '../../../../../../../extensions.js';
 import { chat_metadata } from '../../../../../../../../script.js';
 import * as stScript from '../../../../../../../../script.js';
-import { stateVectorsTable } from '../../data/db.js';
+import { ensureDataset, markDatasetDirty } from '../../data/vector-store.js';
 import { EXT_ID } from '../../../../core/constants.js';
 import { xbLog } from '../../../../core/debug-core.js';
 import {
@@ -383,7 +383,7 @@ export function replaceStateAtoms(atoms) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// StateVector 操作（IndexedDB）
+// StateVector 操作（后端 vector-store）
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
@@ -392,6 +392,7 @@ export function replaceStateAtoms(atoms) {
 export async function saveStateVectors(chatId, items, fingerprint) {
     if (!chatId || !items?.length) return;
 
+    const ds = await ensureDataset(chatId);
     const records = items.map(item => ({
         chatId,
         atomId: item.atomId,
@@ -403,7 +404,10 @@ export async function saveStateVectors(chatId, items, fingerprint) {
         fingerprint,
     }));
 
-    await stateVectorsTable.bulkPut(records);
+    for (const record of records) {
+        ds.stateVectors.set(record.atomId, record);
+    }
+    markDatasetDirty(chatId);
     applyRecallRuntimeMutationBestEffort(chatId, {
         type: 'upsertStateVectors',
         items: records,
@@ -417,8 +421,8 @@ export async function saveStateVectors(chatId, items, fingerprint) {
 export async function getAllStateVectors(chatId) {
     if (!chatId) return [];
 
-    const records = await stateVectorsTable.where('chatId').equals(chatId).toArray();
-    return records.map(r => ({
+    const ds = await ensureDataset(chatId);
+    return [...ds.stateVectors.values()].map(r => ({
         ...r,
         vector: bufferToFloat32(r.vector),
         rVector: r.rVector ? bufferToFloat32(r.rVector) : null,
@@ -431,11 +435,15 @@ export async function getAllStateVectors(chatId) {
 export async function deleteStateVectorsFromFloor(chatId, floor) {
     if (!chatId) return;
 
-    const deleted = await stateVectorsTable
-        .where('chatId')
-        .equals(chatId)
-        .filter(v => v.floor >= floor)
-        .delete();
+    const ds = await ensureDataset(chatId);
+    let deleted = 0;
+    for (const [atomId, record] of [...ds.stateVectors.entries()]) {
+        if (record.floor >= floor) {
+            ds.stateVectors.delete(atomId);
+            deleted++;
+        }
+    }
+    if (deleted > 0) markDatasetDirty(chatId);
 
     applyRecallRuntimeMutationBestEffort(chatId, {
         type: 'deleteStateVectorsFromFloor',
@@ -452,7 +460,10 @@ export async function deleteStateVectorsFromFloor(chatId, floor) {
 export async function clearStateVectors(chatId) {
     if (!chatId) return;
 
-    const deleted = await stateVectorsTable.where('chatId').equals(chatId).delete();
+    const ds = await ensureDataset(chatId);
+    const deleted = ds.stateVectors.size;
+    ds.stateVectors.clear();
+    if (deleted > 0) markDatasetDirty(chatId);
     await clearRecallRuntime(chatId, 'state');
     if (deleted > 0) {
         xbLog.info(MODULE_ID, `清空 ${deleted} 个 StateVector`);
@@ -464,5 +475,6 @@ export async function clearStateVectors(chatId) {
  */
 export async function getStateVectorsCount(chatId) {
     if (!chatId) return 0;
-    return await stateVectorsTable.where('chatId').equals(chatId).count();
+    const ds = await ensureDataset(chatId);
+    return ds.stateVectors.size;
 }
