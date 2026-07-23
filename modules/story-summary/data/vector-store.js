@@ -233,6 +233,7 @@ function createDataset(chatId) {
         loading: null,
         loaded: false,
         serverFileExists: false,
+        baseSavedAt: 0,      // 当前内存数据对应的服务器版本（savedAt）
         dirtyVersion: 0,
         savedVersion: 0,
         saving: false,
@@ -272,6 +273,7 @@ export async function ensureDataset(chatId) {
             if (loaded) {
                 applySerializedData(ds, loaded.parsed);
                 ds.serverFileExists = true;
+                ds.baseSavedAt = Number(loaded.parsed.manifest?.savedAt) || 0;
                 if (loaded.needsReupload) {
                     // 缓存领先于服务器（上次上传没完成）：补传
                     ds.dirtyVersion++;
@@ -700,6 +702,7 @@ async function saveDataset(ds, { silent = true, keepaliveHint = false } = {}) {
 
         ds.savedVersion = Math.max(ds.savedVersion, versionToSave);
         ds.serverFileExists = true;
+        ds.baseSavedAt = savedAt;
         ds.retryCount = 0;
         if (ds.retryTimer) {
             clearTimeout(ds.retryTimer);
@@ -808,12 +811,47 @@ async function migrateFromLegacyIndexedDb(ds) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 多设备：回到前台时校验服务器版本，别的设备写过就失效本地数据集
+// （失效后下次访问会重新加载；本地有未上传改动时以本地为准，不失效）
+// ═══════════════════════════════════════════════════════════════════════════
+
+const REVALIDATE_MIN_INTERVAL_MS = 30 * 1000;
+let lastRevalidateAt = 0;
+
+async function revalidateLoadedDatasets(reason = 'focus') {
+    const now = Date.now();
+    if (now - lastRevalidateAt < REVALIDATE_MIN_INTERVAL_MS) return;
+    lastRevalidateAt = now;
+
+    const headers = await resolveRequestHeaders();
+    if (!headers) return;
+
+    for (const [key, ds] of [...datasets.entries()]) {
+        if (!ds.loaded || ds.saving) continue;
+        if (ds.dirtyVersion !== ds.savedVersion) continue;
+        if (!ds.baseSavedAt) continue;
+
+        const meta = await fetchServerVectorMeta(key, headers);
+        if (meta && meta.v > ds.baseSavedAt) {
+            if (ds.saveTimer) clearTimeout(ds.saveTimer);
+            if (ds.retryTimer) clearTimeout(ds.retryTimer);
+            datasets.delete(key);
+            xbLog.info(MODULE_ID, `服务器向量数据有更新（其他设备写入），失效本地数据集待重载: chat=${key} reason=${reason}`);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 页面隐藏/卸载时的兜底 flush
 // ═══════════════════════════════════════════════════════════════════════════
 
 if (typeof window !== 'undefined') {
     window.addEventListener('pagehide', () => flushAllDatasetsBestEffort('pagehide'));
     document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'hidden') flushAllDatasetsBestEffort('hidden');
+        if (document.visibilityState === 'hidden') {
+            flushAllDatasetsBestEffort('hidden');
+        } else if (document.visibilityState === 'visible') {
+            revalidateLoadedDatasets('visible').catch(() => {});
+        }
     });
 }

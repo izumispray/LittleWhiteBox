@@ -187,6 +187,16 @@ async function backupTarget(target, reason = 'cycle') {
         const fingerprint = await computeFingerprint(db);
         if (fingerprint === target.lastUploadedFingerprint) return;
 
+        // 防止盖掉其他设备刚写的快照：服务器版本超出本设备已知范围时暂停上传
+        const marker = readSyncMarker(target.dbName);
+        if (marker?.serverFingerprint) {
+            const serverMeta = await fetchServerMeta(target.dbName);
+            if (serverMeta && serverMeta.fingerprint !== marker.serverFingerprint) {
+                xbLog.warn(MODULE_ID, `${target.dbName} 服务器快照已被其他设备更新，本设备暂停上传（刷新页面以拉取最新数据）`);
+                return;
+            }
+        }
+
         const schema = buildSchemaSpec(db);
         const counts = {};
         const zipEntries = {};
@@ -226,6 +236,11 @@ async function backupTarget(target, reason = 'cycle') {
         }));
 
         target.lastUploadedFingerprint = fingerprint;
+        writeSyncMarker(target.dbName, {
+            localFingerprint: fingerprint,
+            serverFingerprint: fingerprint,
+            syncedAt: Date.now(),
+        });
         xbLog.info(MODULE_ID, `已备份 ${target.dbName} → 后端 (${(zipData.byteLength / 1024).toFixed(0)}KB, reason=${reason})`);
     } catch (e) {
         xbLog.warn(MODULE_ID, `备份 ${target.dbName} 失败: ${e?.message || e}`);
@@ -236,8 +251,33 @@ async function backupTarget(target, reason = 'cycle') {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 恢复（本地库不存在或为空 → 从后端快照重建）
+// 恢复与多设备同步
+//
+// 每台设备在 localStorage 记一个同步标记 {localFingerprint, serverFingerprint}：
+// - 本地为空 + 后端有快照        → 全量恢复
+// - 服务器更新了、本地自上次同步没改 → 快进恢复（多设备切换的正常路径）
+// - 两边都改了 / 没有标记          → 本地优先并警告（周期备份会覆盖服务器）
+// - 备份前发现服务器被其他设备更新   → 暂停上传，避免盖掉别人的新数据
 // ═══════════════════════════════════════════════════════════════════════════
+
+const SYNC_STATE_LS_KEY = 'LWB_IdbSyncState';
+
+function readSyncMarker(dbName) {
+    try {
+        const all = JSON.parse(localStorage.getItem(SYNC_STATE_LS_KEY) || '{}');
+        return all?.[dbName] || null;
+    } catch {
+        return null;
+    }
+}
+
+function writeSyncMarker(dbName, marker) {
+    try {
+        const all = JSON.parse(localStorage.getItem(SYNC_STATE_LS_KEY) || '{}');
+        all[dbName] = marker;
+        localStorage.setItem(SYNC_STATE_LS_KEY, JSON.stringify(all));
+    } catch { /* 忽略 */ }
+}
 
 async function fetchServerMeta(dbName) {
     try {
@@ -253,49 +293,46 @@ async function fetchServerMeta(dbName) {
     }
 }
 
-async function isLocalDbEmpty(dbName) {
-    if (!(await Dexie.exists(dbName))) return true;
+async function inspectLocalDb(dbName) {
+    if (!(await Dexie.exists(dbName))) return { exists: false, empty: true, fingerprint: null };
     const db = new Dexie(dbName);
     try {
         await db.open();
+        let empty = true;
         for (const table of db.tables) {
-            if (await table.count() > 0) return false;
+            if (await table.count() > 0) {
+                empty = false;
+                break;
+            }
         }
-        return true;
+        const fingerprint = empty ? null : await computeFingerprint(db);
+        return { exists: true, empty, fingerprint };
     } catch {
-        return false;
+        return { exists: true, empty: false, fingerprint: null };
     } finally {
         try { db.close(); } catch { /* 已关闭 */ }
     }
 }
 
-async function restoreTargetIfNeeded(target) {
-    const serverMeta = await fetchServerMeta(target.dbName);
-    if (!serverMeta) return;   // 后端没有快照
-
-    if (!(await isLocalDbEmpty(target.dbName))) {
-        // 本地有数据：以本地为准，周期备份会覆盖后端旧快照
-        return;
-    }
-
+async function restoreFromServerSnapshot(target, { clearFirst = false } = {}) {
     const res = await fetch(`/user/files/${zipFilename(target.dbName)}`, {
         headers: getRequestHeaders(),
         cache: 'no-cache',
     });
-    if (!res.ok) return;
+    if (!res.ok) return false;
     const buf = await res.arrayBuffer();
-    if (!buf?.byteLength) return;
+    if (!buf?.byteLength) return false;
 
     let unzipped;
     try {
         unzipped = unzipSync(new Uint8Array(buf));
     } catch {
         xbLog.warn(MODULE_ID, `后端快照无法解压: ${target.dbName}`);
-        return;
+        return false;
     }
-    if (!unzipped['manifest.json']) return;
+    if (!unzipped['manifest.json']) return false;
     const manifest = JSON.parse(strFromU8(unzipped['manifest.json']));
-    if (manifest.version !== FORMAT_VERSION || manifest.dbName !== target.dbName) return;
+    if (manifest.version !== FORMAT_VERSION || manifest.dbName !== target.dbName) return false;
 
     const dbExists = await Dexie.exists(target.dbName);
     const db = new Dexie(target.dbName);
@@ -316,6 +353,7 @@ async function restoreTargetIfNeeded(target) {
                 xbLog.warn(MODULE_ID, `恢复时缺表，跳过: ${target.dbName}.${tableName}`);
                 continue;
             }
+            if (clearFirst) await table.clear();
             const rows = JSON.parse(strFromU8(entry)).map(decodeValue);
             if (rows.length) {
                 await table.bulkPut(rows);
@@ -323,13 +361,49 @@ async function restoreTargetIfNeeded(target) {
             }
         }
 
-        target.lastUploadedFingerprint = manifest.fingerprint;
+        // 用导入后的本地指纹做基线（verno 等差异可能让它与 manifest.fingerprint 不同）
+        const localFingerprint = await computeFingerprint(db);
+        target.lastUploadedFingerprint = localFingerprint;
+        writeSyncMarker(target.dbName, {
+            localFingerprint,
+            serverFingerprint: manifest.fingerprint,
+            syncedAt: Date.now(),
+        });
         xbLog.info(MODULE_ID, `已从后端恢复 ${target.dbName}: ${restoredRows} 行 (快照时间 ${new Date(manifest.exportedAt).toISOString()})`);
+        return true;
     } catch (e) {
         xbLog.warn(MODULE_ID, `恢复 ${target.dbName} 失败: ${e?.message || e}`);
+        return false;
     } finally {
         try { db.close(); } catch { /* 已关闭 */ }
     }
+}
+
+async function syncTargetOnStartup(target) {
+    const serverMeta = await fetchServerMeta(target.dbName);
+    if (!serverMeta) return;   // 后端无快照：本地数据由周期备份建立首个快照
+
+    const local = await inspectLocalDb(target.dbName);
+    if (local.empty) {
+        await restoreFromServerSnapshot(target);
+        return;
+    }
+
+    const marker = readSyncMarker(target.dbName);
+    if (marker && serverMeta.fingerprint === marker.serverFingerprint) {
+        // 服务器自上次同步没变：本地改没改交给周期备份判断
+        target.lastUploadedFingerprint = marker.localFingerprint || null;
+        return;
+    }
+    if (marker && local.fingerprint && local.fingerprint === marker.localFingerprint) {
+        // 服务器更新了而本地没改 → 快进到服务器版本（多设备切换的正常路径）
+        xbLog.info(MODULE_ID, `${target.dbName} 服务器快照有更新且本地未改动，快进恢复`);
+        await restoreFromServerSnapshot(target, { clearFirst: true });
+        return;
+    }
+    // 两边都动过 / 没有同步标记：本地优先，周期备份会覆盖服务器快照
+    xbLog.warn(MODULE_ID, `${target.dbName} 本地与服务器快照分叉，本地优先（服务器版本将被覆盖）`);
+    target.lastUploadedFingerprint = null;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -357,9 +431,9 @@ export async function initIdbBackendSync() {
 
     for (const target of SYNC_TARGETS) {
         try {
-            await restoreTargetIfNeeded(target);
+            await syncTargetOnStartup(target);
         } catch (e) {
-            xbLog.warn(MODULE_ID, `启动恢复检查失败 ${target.dbName}: ${e?.message || e}`);
+            xbLog.warn(MODULE_ID, `启动同步检查失败 ${target.dbName}: ${e?.message || e}`);
         }
     }
 
