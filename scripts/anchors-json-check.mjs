@@ -1,4 +1,4 @@
-import { extractAnchorsPayload } from '../modules/story-summary/vector/llm/anchors-json.js';
+import { extractAnchorsPayload, stripThinkingBlocks } from '../modules/story-summary/vector/llm/anchors-json.js';
 
 const clean = '{"anchors":[{"scene":"旅人推开酒馆的门向老板娘玛莎点了一杯麦酒。玛莎笑着将麦酒推到旅人面前，并压低声音神秘地告知他，北边的矿洞最近正在闹鬼。","edges":[{"s":"旅人","t":"老板娘玛莎","r":"点麦酒"}],"where":"酒馆"}]}';
 
@@ -20,6 +20,16 @@ const cases = [
     ['scene含大括号', () => { const r = extractAnchorsPayload(braces); return r?.anchors?.length === 1; }],
     ['纯文本无JSON', () => extractAnchorsPayload('抱歉，我不能处理这个请求。') === null],
     ['空输入', () => extractAnchorsPayload('') === null],
+    ['strip: think块后接答案', () => stripThinkingBlocks('<think>推理推理</think>\n' + clean) === clean],
+    ['strip: thinking标签变体', () => stripThinkingBlocks('<thinking>a</thinking>X') === 'X'],
+    ['strip: 多个成对块', () => stripThinkingBlocks('<think>a</think>中<think>b</think>尾') === '尾'],
+    ['strip: 未闭合被截断→空', () => stripThinkingBlocks('<think>推理到一半被截断') === ''],
+    ['strip: 闭合后无内容→移除块', () => stripThinkingBlocks('<think>a</think>') === ''],
+    ['strip: 无标签原样返回', () => stripThinkingBlocks(clean) === clean],
+    ['strip+extract 组合', () => {
+        const r = extractAnchorsPayload(stripThinkingBlocks('<think>模板：{"anchors":[{"scene":"60-100字场景描述"}]}</think>\n' + clean));
+        return r?.anchors?.length === 1 && r.anchors[0].scene.includes('矿洞');
+    }],
 ];
 
 let failed = 0;

@@ -1645,21 +1645,21 @@
       "publicPath": "scripts/extensions/third-party/LittleWhiteBox/modules/story-summary/vector/llm/anchors-json.js",
       "relativePath": "modules/story-summary/vector/llm/anchors-json.js",
       "extension": ".js",
-      "sizeBytes": 4019
+      "sizeBytes": 5168
     },
     {
       "source": "littlewhitebox",
       "publicPath": "scripts/extensions/third-party/LittleWhiteBox/modules/story-summary/vector/llm/atom-extraction.js",
       "relativePath": "modules/story-summary/vector/llm/atom-extraction.js",
       "extension": ".js",
-      "sizeBytes": 14871
+      "sizeBytes": 15441
     },
     {
       "source": "littlewhitebox",
       "publicPath": "scripts/extensions/third-party/LittleWhiteBox/modules/story-summary/vector/llm/llm-service.js",
       "relativePath": "modules/story-summary/vector/llm/llm-service.js",
       "extension": ".js",
-      "sizeBytes": 7056
+      "sizeBytes": 7986
     },
     {
       "source": "littlewhitebox",

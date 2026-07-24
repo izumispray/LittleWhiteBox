@@ -50,6 +50,36 @@ function isMeaningfulAnchor(anchor) {
     return !PLACEHOLDER_SCENE_RE.test(scene);
 }
 
+/**
+ * 剥离 content 中内联的思维链，只留最终答案。
+ * 网关/模型常见形态：
+ * - "<think>...</think>答案"         → 取最后一个闭合标签之后
+ * - "<think>...（被截断，无闭合）"    → 全是思维链，返回空串
+ * - 多个成对块                        → 全部移除
+ * - 无标签的纯文本推理泄漏            → 原样返回，交给 extractAnchorsPayload 从末尾找 JSON
+ */
+export function stripThinkingBlocks(rawText) {
+    const s = String(rawText || '');
+    if (!s) return '';
+
+    const closeRe = /<\/think(?:ing)?>/gi;
+    let lastClose = -1;
+    let m;
+    while ((m = closeRe.exec(s)) !== null) lastClose = m.index + m[0].length;
+
+    if (lastClose !== -1) {
+        const after = s.slice(lastClose).trim();
+        if (after) return after;
+        // 闭合标签后没有内容：移除所有成对块，看是否还剩答案
+        return s.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '').trim();
+    }
+
+    // 只有开标签没有闭合（思考中途被截断）：整段都是思维链
+    if (/^\s*<think(?:ing)?>/i.test(s)) return '';
+
+    return s;
+}
+
 function salvageTruncatedAnchors(text) {
     const keyIdx = text.lastIndexOf('"anchors"');
     if (keyIdx === -1) return null;

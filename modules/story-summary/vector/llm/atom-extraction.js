@@ -8,7 +8,7 @@
 // 每楼层 1-2 个场景锚点（非碎片原子），60-100 字场景摘要
 // ============================================================================
 
-import { callLLM, cancelAllL0Requests } from './llm-service.js';
+import { callLLMWithMeta, cancelAllL0Requests } from './llm-service.js';
 import { extractAnchorsPayload } from './anchors-json.js';
 import { xbLog } from '../../../../core/debug-core.js';
 import { filterText } from '../utils/text-filter.js';
@@ -233,7 +233,7 @@ async function extractAtomsForRoundWithRetry(userMessage, aiMessage, aiFloor, op
         if (batchCancelled) return [];
 
         try {
-            const response = await callLLM([
+            const result = await callLLMWithMeta([
                 { role: 'system', content: SYSTEM_PROMPT },
                 { role: 'user', content: input },
             ], {
@@ -244,14 +244,19 @@ async function extractAtomsForRoundWithRetry(userMessage, aiMessage, aiFloor, op
                 timeout,
             });
 
-            const rawText = String(response || '');
-            xbLog.info(MODULE_ID, `floor ${aiFloor} attempt ${attempt} rawText(len=${rawText.length}): ${previewText(rawText)}`);
+            // 思维链已在 llm-service 层剥离，这里只处理正文
+            const rawText = String(result?.text || '');
+            const finishReason = result?.finishReason || null;
+            const reasoningLength = result?.reasoningLength || 0;
+            xbLog.info(MODULE_ID, `floor ${aiFloor} attempt ${attempt} finish=${finishReason || '?'} reasoning=${reasoningLength}字 text(len=${rawText.length}): ${previewText(rawText)}`);
             if (!rawText.trim()) {
                 if (attempt < RETRY_COUNT) {
                     await sleep(RETRY_DELAY);
                     continue;
                 }
-                throw new Error('LLM 返回空内容');
+                throw new Error(finishReason === 'length'
+                    ? `无正文输出：思维链耗尽 max_tokens 被截断（思考 ${reasoningLength} 字）`
+                    : `无正文输出（finish=${finishReason || '?'}，思维链 ${reasoningLength} 字）`);
             }
 
             const payload = extractAnchorsPayload(rawText);
@@ -261,7 +266,7 @@ async function extractAtomsForRoundWithRetry(userMessage, aiMessage, aiFloor, op
                     await sleep(RETRY_DELAY);
                     continue;
                 }
-                throw new Error(`无法解析锚点JSON: ${previewText(rawText, 80)}`);
+                throw new Error(`无法解析锚点JSON${finishReason === 'length' ? '（输出被截断）' : ''}: ${previewText(rawText, 80)}`);
             }
             if (payload.salvaged) {
                 xbLog.warn(MODULE_ID, `floor ${aiFloor} 输出被截断，已挽救 ${payload.anchors.length} 个完整锚点`);

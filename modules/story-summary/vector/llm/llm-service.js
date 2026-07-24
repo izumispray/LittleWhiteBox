@@ -4,6 +4,7 @@
 import { xbLog } from '../../../../core/debug-core.js';
 import { getVectorConfig } from '../../data/config.js';
 import { getDefaultApiPrefix, resolveApiBaseUrl } from '../../../../shared/common/openai-url-utils.js';
+import { stripThinkingBlocks } from './anchors-json.js';
 
 const MODULE_ID = 'vector-llm-service';
 const DEFAULT_L0_MODEL = 'Qwen/Qwen3-8B';
@@ -79,11 +80,11 @@ function mergeSignals(primary, secondary) {
     return controller.signal;
 }
 
-function extractMessageText(data) {
-    const content = data?.choices?.[0]?.message?.content;
-    if (typeof content === 'string') return content;
+function extractMessageParts(data) {
+    const msg = data?.choices?.[0]?.message;
+    let content = msg?.content;
     if (Array.isArray(content)) {
-        return content
+        content = content
             .map(part => {
                 if (typeof part === 'string') return part;
                 if (part?.type === 'text' && typeof part.text === 'string') return part.text;
@@ -91,13 +92,21 @@ function extractMessageText(data) {
             })
             .join('');
     }
-    return '';
+    if (typeof content !== 'string') content = '';
+    // 思维链字段只用于诊断，绝不参与正文解析
+    const reasoning = typeof msg?.reasoning_content === 'string'
+        ? msg.reasoning_content
+        : (typeof msg?.reasoning === 'string' ? msg.reasoning : '');
+    return { content, reasoning };
 }
 
 /**
  * 统一 L0 调用 - 浏览器直连 OpenAI-compatible Chat Completions（非流式）
+ * 返回 {text, finishReason, reasoningLength}：
+ * - text 已剥离内联 <think> 思维链，reasoning_content 字段被忽略
+ * - finishReason/reasoningLength 供上层生成可诊断的失败原因
  */
-export async function callLLM(messages, options = {}) {
+export async function callLLMWithMeta(messages, options = {}) {
     const {
         temperature = 0.2,
         max_tokens = 500,
@@ -161,7 +170,12 @@ export async function callLLM(messages, options = {}) {
         }
 
         const data = await response.json();
-        return String(extractMessageText(data) ?? '');
+        const { content, reasoning } = extractMessageParts(data);
+        return {
+            text: stripThinkingBlocks(content),
+            finishReason: data?.choices?.[0]?.finish_reason ?? null,
+            reasoningLength: reasoning.length,
+        };
     } catch (e) {
         clearTimeout(timeoutId);
         if (e?.name === 'AbortError' && timedOut) {
@@ -173,6 +187,12 @@ export async function callLLM(messages, options = {}) {
         clearTimeout(timeoutId);
         activeL0Controllers.delete(timeoutController);
     }
+}
+
+/** 兼容包装：只要正文文本 */
+export async function callLLM(messages, options = {}) {
+    const result = await callLLMWithMeta(messages, options);
+    return result.text;
 }
 
 export async function testL0Service(apiConfig = {}) {
