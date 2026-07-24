@@ -1568,14 +1568,14 @@
       "publicPath": "scripts/extensions/third-party/LittleWhiteBox/modules/story-summary/data/config.js",
       "relativePath": "modules/story-summary/data/config.js",
       "extension": ".js",
-      "sizeBytes": 25520
+      "sizeBytes": 26408
     },
     {
       "source": "littlewhitebox",
       "publicPath": "scripts/extensions/third-party/LittleWhiteBox/modules/story-summary/data/vector-store.js",
       "relativePath": "modules/story-summary/data/vector-store.js",
       "extension": ".js",
-      "sizeBytes": 24165
+      "sizeBytes": 36756
     },
     {
       "source": "littlewhitebox",
@@ -1617,7 +1617,7 @@
       "publicPath": "scripts/extensions/third-party/LittleWhiteBox/modules/story-summary/story-summary-ui.js",
       "relativePath": "modules/story-summary/story-summary-ui.js",
       "extension": ".js",
-      "sizeBytes": 129280
+      "sizeBytes": 127408
     },
     {
       "source": "littlewhitebox",
@@ -1631,21 +1631,28 @@
       "publicPath": "scripts/extensions/third-party/LittleWhiteBox/modules/story-summary/story-summary.html",
       "relativePath": "modules/story-summary/story-summary.html",
       "extension": ".html",
-      "sizeBytes": 75856
+      "sizeBytes": 75015
     },
     {
       "source": "littlewhitebox",
       "publicPath": "scripts/extensions/third-party/LittleWhiteBox/modules/story-summary/story-summary.js",
       "relativePath": "modules/story-summary/story-summary.js",
       "extension": ".js",
-      "sizeBytes": 133696
+      "sizeBytes": 122881
+    },
+    {
+      "source": "littlewhitebox",
+      "publicPath": "scripts/extensions/third-party/LittleWhiteBox/modules/story-summary/vector/llm/anchors-json.js",
+      "relativePath": "modules/story-summary/vector/llm/anchors-json.js",
+      "extension": ".js",
+      "sizeBytes": 4019
     },
     {
       "source": "littlewhitebox",
       "publicPath": "scripts/extensions/third-party/LittleWhiteBox/modules/story-summary/vector/llm/atom-extraction.js",
       "relativePath": "modules/story-summary/vector/llm/atom-extraction.js",
       "extension": ".js",
-      "sizeBytes": 14739
+      "sizeBytes": 14871
     },
     {
       "source": "littlewhitebox",
@@ -1765,13 +1772,6 @@
       "relativePath": "modules/story-summary/vector/storage/state-store.js",
       "extension": ".js",
       "sizeBytes": 16746
-    },
-    {
-      "source": "littlewhitebox",
-      "publicPath": "scripts/extensions/third-party/LittleWhiteBox/modules/story-summary/vector/storage/vector-io.js",
-      "relativePath": "modules/story-summary/vector/storage/vector-io.js",
-      "extension": ".js",
-      "sizeBytes": 33924
     },
     {
       "source": "littlewhitebox",

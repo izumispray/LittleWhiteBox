@@ -766,33 +766,22 @@
                                 </div>
                             </div>
 
-                            <!-- Tools & Settings -->
+                            <!-- Archive -->
                             <div>
                                 <div class="neo-tools-header">
-                                    <span>导出与导入</span>
+                                    <span>云端存档</span>
                                 </div>
-                                <!-- Import/Export -->
                                 <div class="settings-row">
                                     <div class="settings-field full">
-                                        <div class="settings-btn-row" style="margin-top:8px">
-                                            <button class="btn btn-sm" id="btn-export-vectors"
-                                                style="flex:1">导出向量数据</button>
-                                            <button class="btn btn-sm" id="btn-import-vectors"
-                                                style="flex:1">导入向量数据</button>
+                                        <label class="settings-checkbox" style="margin-top:8px">
+                                            <input type="checkbox" id="vector-archive-toggle" checked>
+                                            <span class="checkbox-mark"></span>
+                                            <span class="checkbox-label">自动存档到后端</span>
+                                        </label>
+                                        <div class="settings-hint" style="margin-top:2px">
+                                            向量数据改动后自动上传到酒馆后端，切换设备自动拉取，无需手动备份。
                                         </div>
-                                        <div class="settings-hint" id="vector-io-status"></div>
-                                        <div class="settings-btn-row" style="margin-top:6px">
-                                            <button class="btn btn-sm" id="btn-backup-server"
-                                                style="flex:1">☁️ 备份向量到服务器</button>
-                                            <button class="btn btn-sm" id="btn-restore-server"
-                                                style="flex:1">☁️ 从服务器恢复向量</button>
-                                        </div>
-                                        <div class="settings-hint" id="server-io-status"></div>
-                                        <div style="margin-top:6px">
-                                            <button class="btn btn-sm" id="btn-manage-backups" style="width:100%">
-                                                ☁️ 管理服务器向量备份
-                                            </button>
-                                        </div>
+                                        <div class="settings-hint" id="vector-archive-status" style="margin-top:6px"></div>
                                     </div>
                                 </div>
                             </div>
@@ -1076,7 +1065,7 @@
                                 </div>
                                 <div class="guide-tip">
                                     <div class="guide-tip-icon">💾</div>
-                                    <div class="guide-tip-text">向量数据支持导出备份，换设备时可以导入恢复，不用重新生成。</div>
+                                    <div class="guide-tip-text">向量数据自动存档到酒馆后端，换设备自动拉取，无需手动备份。</div>
                                 </div>
                                 <div class="guide-tip">
                                     <div class="guide-tip-icon">⚡</div>

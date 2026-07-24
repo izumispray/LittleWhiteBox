@@ -24,12 +24,60 @@ const persistence = {
     mode: 'auto',   // 'auto' | 'server' | 'memory'
 };
 
+// 自动存档开关（关闭时改动只留在内存，重新打开后补传）
+let autoSaveEnabled = true;
+
 let headersFactoryPromise = null;
 
 export function configureVectorStorePersistence({ mode } = {}) {
     if (mode === 'memory' || mode === 'server' || mode === 'auto') {
         persistence.mode = mode;
     }
+}
+
+export function setVectorStoreAutoSave(enabled) {
+    const next = enabled !== false;
+    if (autoSaveEnabled === next) return;
+    autoSaveEnabled = next;
+    if (next) {
+        // 重新开启：补传所有脏数据集
+        for (const ds of datasets.values()) {
+            if (ds.loaded && ds.dirtyVersion !== ds.savedVersion && !ds.saveTimer) {
+                ds.saveTimer = setTimeout(() => {
+                    ds.saveTimer = null;
+                    saveDataset(ds).catch(() => {});
+                }, 0);
+            }
+        }
+        xbLog.info(MODULE_ID, '自动存档已开启，补传未保存的向量数据');
+    } else {
+        for (const ds of datasets.values()) {
+            if (ds.saveTimer) { clearTimeout(ds.saveTimer); ds.saveTimer = null; }
+            if (ds.retryTimer) { clearTimeout(ds.retryTimer); ds.retryTimer = null; }
+        }
+        xbLog.warn(MODULE_ID, '自动存档已关闭，向量改动仅保留在内存中');
+    }
+}
+
+export function isVectorStoreAutoSaveEnabled() {
+    return autoSaveEnabled;
+}
+
+/** 当前 chat 的存档状态（供设置面板展示） */
+export function getVectorArchiveStatus(chatId) {
+    const key = String(chatId || '');
+    const ds = key ? datasets.get(key) : null;
+    return {
+        mode: persistence.mode,
+        autoSave: autoSaveEnabled,
+        loaded: !!ds?.loaded,
+        filename: key ? getVectorDataFilename(key) : null,
+        serverFileExists: !!ds?.serverFileExists,
+        lastSavedAt: ds?.baseSavedAt || null,
+        dirty: !!ds && ds.dirtyVersion !== ds.savedVersion,
+        saving: !!ds?.saving,
+        retryCount: ds?.retryCount || 0,
+    };
 }
 
 async function resolveRequestHeaders() {
@@ -304,6 +352,7 @@ export function markDatasetDirty(chatId) {
     const ds = datasets.get(String(chatId || ''));
     if (!ds) return;
     ds.dirtyVersion++;
+    if (!autoSaveEnabled) return;   // 开关关闭：只记账不上传，开启时补传
     if (ds.saveTimer) clearTimeout(ds.saveTimer);
     ds.saveTimer = setTimeout(() => {
         ds.saveTimer = null;
@@ -336,6 +385,7 @@ export async function flushDataset(chatId, { silent = true } = {}) {
 
 /** flush 所有脏数据集（页面隐藏/卸载时 best-effort） */
 export function flushAllDatasetsBestEffort(reason = 'flush-all') {
+    if (!autoSaveEnabled) return;
     for (const ds of datasets.values()) {
         if (!ds.loaded || ds.dirtyVersion === ds.savedVersion) continue;
         if (ds.saveTimer) {
@@ -637,6 +687,10 @@ async function loadDatasetWithCache(chatId) {
 async function saveDataset(ds, { silent = true, keepaliveHint = false } = {}) {
     if (!ds.loaded && !ds.loading) return true;
     if (ds.dirtyVersion === ds.savedVersion) return true;
+    if (!autoSaveEnabled) {
+        if (!silent) throw new Error('自动存档已关闭');
+        return false;   // 未保存：retainDatasets 不会逐出脏数据集
+    }
 
     if (ds.saving) {
         // 已有保存在途：等它结束后由 finally 里的补偿逻辑重新调度

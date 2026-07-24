@@ -380,6 +380,7 @@ function normalizeVectorConfig(rawVector = null) {
     return {
         enabled: !!rawVector?.enabled,
         engine: "online",
+        autoArchive: rawVector?.autoArchive !== false,
         l0Concurrency: Math.max(1, Math.min(50, Number(rawVector?.l0Concurrency) || 10)),
         l0Api: normalizeOpenAiCompatApiConfig(rawVector?.l0Api, {
             provider: sharedProvider,

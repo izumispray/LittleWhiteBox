@@ -761,6 +761,7 @@
         return {
             enabled: $('vector-enabled')?.checked || false,
             engine: 'online',
+            autoArchive: $('vector-archive-toggle')?.checked !== false,
             l0Concurrency: Math.max(1, Math.min(50, Number($('vector-l0-concurrency')?.value) || 10)),
             l0Api: getVectorApiConfig('l0'),
             embeddingApi: getVectorApiConfig('embedding'),
@@ -774,6 +775,8 @@
         $('vector-config-area').classList.toggle('hidden', !cfg.enabled);
         syncVectorBoundaryControl(cfg.enabled, config.ui.hideSummarized);
         $('vector-l0-concurrency').value = String(Math.max(1, Math.min(50, Number(cfg.l0Concurrency) || 10)));
+        const archiveToggle = $('vector-archive-toggle');
+        if (archiveToggle) archiveToggle.checked = cfg.autoArchive !== false;
         loadVectorApiConfig('l0', cfg.l0Api || {});
         loadVectorApiConfig('embedding', cfg.embeddingApi || {});
         loadVectorApiConfig('rerank', cfg.rerankApi || {});
@@ -861,6 +864,30 @@
         $('vector-atom-count').textContent = stats.stateVectors || 0;
         $('vector-chunk-count').textContent = stats.chunkCount || 0;
         $('vector-event-count').textContent = stats.eventVectors || 0;
+    }
+
+    function updateVectorArchiveStatus(a) {
+        const toggle = $('vector-archive-toggle');
+        if (toggle) toggle.checked = a.autoSave !== false;
+        const el = $('vector-archive-status');
+        if (!el) return;
+        if (a.autoSave === false) {
+            el.textContent = '⏸ 自动存档已关闭，向量改动仅保留在本页面内存中';
+            return;
+        }
+        if (a.mode === 'memory') {
+            el.textContent = '⚠ 当前环境不支持后端存档（内存模式）';
+            return;
+        }
+        const parts = [];
+        if (a.saving) parts.push('保存中…');
+        else if (a.dirty) parts.push('有改动待保存');
+        else if (a.serverFileExists) parts.push('✓ 已同步到后端');
+        else if (a.loaded) parts.push('暂无存档（生成向量后自动创建）');
+        else parts.push('尚未加载');
+        if (a.lastSavedAt) parts.push('最近保存 ' + new Date(a.lastSavedAt).toLocaleString());
+        if (a.retryCount > 0) parts.push(`⚠ 上传失败，重试中 (${a.retryCount})`);
+        el.textContent = parts.join(' · ');
     }
 
     function showVectorMismatchWarning(show) {
@@ -1017,30 +1044,9 @@
 
         $('btn-cancel-vectors').onclick = () => postMsg('VECTOR_CANCEL_GENERATE');
 
-        $('btn-export-vectors').onclick = () => {
-            $('btn-export-vectors').disabled = true;
-            $('vector-io-status').textContent = '导出中...';
-            postMsg('VECTOR_EXPORT');
+        $('vector-archive-toggle').onchange = (e) => {
+            postMsg('VECTOR_ARCHIVE_TOGGLE', { enabled: !!e.target.checked });
         };
-
-        $('btn-import-vectors').onclick = () => {
-            $('btn-import-vectors').disabled = true;
-            $('vector-io-status').textContent = '导入中...';
-            postMsg('VECTOR_IMPORT_PICK');
-        };
-        $('btn-backup-server').onclick = () => {
-            $('btn-backup-server').disabled = true;
-            $('server-io-status').textContent = '备份中...';
-            postMsg('VECTOR_BACKUP_SERVER');
-        };
-
-        $('btn-restore-server').onclick = () => {
-            $('btn-restore-server').disabled = true;
-            $('server-io-status').textContent = '恢复中...';
-            postMsg('VECTOR_RESTORE_SERVER');
-        };
-
-        $('btn-manage-backups').onclick = () => postMsg('VECTOR_LIST_BACKUPS');
 
         initAnchorUI();
         postMsg('REQUEST_ANCHOR_STATS');
@@ -2380,6 +2386,7 @@
             case 'VECTOR_STATS':
                 updateVectorStats(d.stats);
                 if (d.mismatch !== undefined) showVectorMismatchWarning(d.mismatch);
+                if (d.archive) updateVectorArchiveStatus(d.archive);
                 break;
 
             case 'ANCHOR_STATS':
@@ -2417,15 +2424,6 @@
                 break;
             }
 
-            case 'VECTOR_EXPORT_RESULT':
-                $('btn-export-vectors').disabled = false;
-                if (d.success) {
-                    $('vector-io-status').textContent = `导出成功: ${d.filename} (${(d.size / 1024 / 1024).toFixed(2)}MB)`;
-                } else {
-                    $('vector-io-status').textContent = '导出失败: ' + (d.error || '未知错误');
-                }
-                break;
-
             case 'SUMMARY_COPY_RESULT':
                 $('btn-copy-summary').disabled = false;
                 if (d.success) {
@@ -2444,43 +2442,6 @@
                     postMsg('REQUEST_ANCHOR_STATS');
                 } else {
                     $('summary-io-status').textContent = '导入失败: ' + (d.error || '未知错误');
-                }
-                break;
-
-            case 'VECTOR_IMPORT_RESULT':
-                $('btn-import-vectors').disabled = false;
-                if (d.success) {
-                    let msg = `导入成功: ${d.chunkCount} 片段, ${d.eventCount} 事件`;
-                    if (d.warnings?.length) {
-                        msg += '\n⚠️ ' + d.warnings.join('\n⚠️ ');
-                    }
-                    $('vector-io-status').textContent = msg;
-                    // 刷新统计
-                    postMsg('REQUEST_VECTOR_STATS');
-                } else {
-                    $('vector-io-status').textContent = '导入失败: ' + (d.error || '未知错误');
-                }
-                break;
-            case 'VECTOR_BACKUP_RESULT':
-                $('btn-backup-server').disabled = false;
-                if (d.success) {
-                    $('server-io-status').textContent = `☁️ 备份成功: ${(d.size / 1024 / 1024).toFixed(2)}MB (${d.chunkCount} 片段, ${d.eventCount} 事件)`;
-                } else {
-                    $('server-io-status').textContent = '备份失败: ' + (d.error || '未知错误');
-                }
-                break;
-
-            case 'VECTOR_RESTORE_RESULT':
-                $('btn-restore-server').disabled = false;
-                if (d.success) {
-                    let msg = `☁️ 恢复成功: ${d.chunkCount} 片段, ${d.eventCount} 事件`;
-                    if (d.warnings?.length) {
-                        msg += '\n⚠️ ' + d.warnings.join('\n⚠️ ');
-                    }
-                    $('server-io-status').textContent = msg;
-                    postMsg('REQUEST_VECTOR_STATS');
-                } else {
-                    $('server-io-status').textContent = '恢复失败: ' + (d.error || '未知错误');
                 }
                 break;
 
