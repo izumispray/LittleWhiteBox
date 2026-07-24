@@ -1638,7 +1638,7 @@
       "publicPath": "scripts/extensions/third-party/LittleWhiteBox/modules/story-summary/story-summary.js",
       "relativePath": "modules/story-summary/story-summary.js",
       "extension": ".js",
-      "sizeBytes": 122881
+      "sizeBytes": 122446
     },
     {
       "source": "littlewhitebox",

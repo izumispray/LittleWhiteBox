@@ -339,8 +339,6 @@ function clearVectorMaintenance(chatId = null) {
 // 向量提醒节流
 let lastVectorWarningAt = 0;
 const VECTOR_WARNING_COOLDOWN_MS = 120000; // 2分钟内不重复提醒
-let backupDeleteSupported = true;
-let backupDeleteUnsupportedReason = '';
 
 const EXT_PROMPT_KEY = "LittleWhiteBox_StorySummary";
 const MIN_INJECTION_DEPTH = 2;
@@ -1265,7 +1263,6 @@ function showOverlay() {
 }
 
 function hideOverlay() {
-    removeBackupManagerModal();
     document.getElementById("xiaobaix-story-summary-overlay")?.remove();
     overlayCreated = false;
     frameReady = false;
@@ -2253,7 +2250,6 @@ async function handleFrameMessage(event) {
             break;
 
         case "SETTINGS_CLOSED":
-            removeBackupManagerModal();
             $(".xb-ss-close-btn").show();
             break;
 
@@ -3092,13 +3088,6 @@ async function handleChatDeleted(chatId) {
     await clearRecallRuntime(chatId);
     // 清理服务器上的向量数据文件
     await deleteDatasetEverywhere(chatId).catch(() => {});
-    try {
-        const filename = getBackupFilename(chatId);
-        await deleteServerBackup(filename, null);
-        xbLog.info(MODULE_ID, `聊天删除，已清理服务器备份: ${filename}`);
-    } catch (_) {
-        // 文件不存在或宿主不支持删除，静默处理
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
