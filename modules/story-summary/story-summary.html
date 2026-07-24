@@ -7,7 +7,22 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <title>剧情总结 · Story Summary</title>
-    <link rel="stylesheet" href="story-summary.css">
+    <script>
+        // 首帧前同步恢复主题：data-theme 与对应 CSS 必须在渲染前就位，
+        // 否则暗色用户每次打开都会先闪一帧亮色默认样式
+        (function () {
+            var theme = 'default';
+            try { theme = localStorage.getItem('xb-theme-alt') || 'default'; } catch (e) { }
+            if (theme === 'dark' || theme === 'neo-dark') {
+                document.documentElement.setAttribute('data-theme', 'dark');
+            }
+            var css = (theme === 'neo' || theme === 'neo-dark') ? 'story-summary-a.css' : 'story-summary.css';
+            document.write('<link rel="stylesheet" href="' + css + '">');
+        })();
+    </script>
+    <noscript>
+        <link rel="stylesheet" href="story-summary.css">
+    </noscript>
     <style>
         #xb-frame-boot {
             position: fixed;
@@ -21,6 +36,11 @@
             opacity: 0;
             pointer-events: none;
             transition: opacity 180ms ease;
+        }
+
+        :root[data-theme="dark"] #xb-frame-boot {
+            background: #121212;
+            color: #d1d5db;
         }
 
         body.xb-frame-loading #xb-frame-boot {
@@ -43,8 +63,17 @@
             animation: xb-frame-boot-spin 800ms linear infinite;
         }
 
+        :root[data-theme="dark"] .xb-frame-boot-ring {
+            border-color: rgba(209, 213, 219, 0.18);
+            border-top-color: #d1d5db;
+        }
+
         .xb-frame-boot-text {
             color: rgba(31, 41, 55, 0.68);
+        }
+
+        :root[data-theme="dark"] .xb-frame-boot-text {
+            color: rgba(209, 213, 219, 0.68);
         }
 
         @keyframes xb-frame-boot-spin {

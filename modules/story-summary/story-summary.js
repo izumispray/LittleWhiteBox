@@ -1219,6 +1219,13 @@ function createOverlay() {
     const isNarrow = window.matchMedia?.("(max-width: 768px)").matches;
     const overlayHeight = (isMobile || isNarrow) ? "92.5vh" : "100vh";
 
+    // iframe 文档加载完成前显示的是元素底色，必须与面板主题一致，否则暗色主题下白屏闪
+    let frameBg = "#fafafa";
+    try {
+        const frameTheme = localStorage.getItem("xb-theme-alt");
+        if (frameTheme === "dark" || frameTheme === "neo-dark") frameBg = "#121212";
+    } catch { /* localStorage 不可用则保持默认 */ }
+
     const $overlay = $(`
         <div id="xiaobaix-story-summary-overlay" style="
             position: fixed !important; inset: 0 !important;
@@ -1237,7 +1244,7 @@ function createOverlay() {
                     src="${iframePath}"
                     style="width:100% !important; height:100% !important; border:none !important;
                            border-radius:12px !important; box-shadow:0 0 30px rgba(0,0,0,.4) !important;
-                           background:#fafafa !important;">
+                           background:${frameBg} !important;">
                 </iframe>
             </div>
             <button class="xb-ss-close-btn" style="
