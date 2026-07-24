@@ -8,7 +8,8 @@
 // 每楼层 1-2 个场景锚点（非碎片原子），60-100 字场景摘要
 // ============================================================================
 
-import { callLLM, cancelAllL0Requests, parseJson } from './llm-service.js';
+import { callLLM, cancelAllL0Requests } from './llm-service.js';
+import { extractAnchorsPayload } from './anchors-json.js';
 import { xbLog } from '../../../../core/debug-core.js';
 import { filterText } from '../utils/text-filter.js';
 
@@ -20,6 +21,9 @@ const RETRY_DELAY = 500;
 const DEFAULT_TIMEOUT = 60000;
 const STAGGER_DELAY = 80;
 const DEBUG_RAW_PREVIEW_LEN = 800;
+// 推理模型的思考也计入 completion 预算（实测可达 2200+ token），需留足余量；
+// 非推理模型输出完即 stop，不受影响
+const MAX_COMPLETION_TOKENS = 8000;
 
 let batchCancelled = false;
 
@@ -234,7 +238,9 @@ async function extractAtomsForRoundWithRetry(userMessage, aiMessage, aiFloor, op
                 { role: 'user', content: input },
             ], {
                 temperature: 0.3,
-                max_tokens: 600,
+                // 思考模型（qwen3 等）会先烧掉数百至上千 token 推理再输出 JSON，
+                // 给太少会在 JSON 之前/中途被 length 截断，表现为整批"失败"
+                max_tokens: MAX_COMPLETION_TOKENS,
                 timeout,
             });
 
@@ -245,33 +251,23 @@ async function extractAtomsForRoundWithRetry(userMessage, aiMessage, aiFloor, op
                     await sleep(RETRY_DELAY);
                     continue;
                 }
-                return null;
+                throw new Error('LLM 返回空内容');
             }
 
-            xbLog.info(MODULE_ID, `floor ${aiFloor} attempt ${attempt} parseSource(len=${rawText.length}): ${previewText(rawText)}`);
-
-            let parsed;
-            try {
-                parsed = parseJson(rawText);
-            } catch (e) {
-                xbLog.warn(MODULE_ID, `floor ${aiFloor} JSON解析失败 (attempt ${attempt})`);
+            const payload = extractAnchorsPayload(rawText);
+            if (!payload) {
+                xbLog.warn(MODULE_ID, `floor ${aiFloor} 无法从输出中提取锚点JSON (attempt ${attempt})`);
                 if (attempt < RETRY_COUNT) {
                     await sleep(RETRY_DELAY);
                     continue;
                 }
-                return null;
+                throw new Error(`无法解析锚点JSON: ${previewText(rawText, 80)}`);
+            }
+            if (payload.salvaged) {
+                xbLog.warn(MODULE_ID, `floor ${aiFloor} 输出被截断，已挽救 ${payload.anchors.length} 个完整锚点`);
             }
 
-            // 兼容：优先 anchors，回退 atoms
-            const rawAnchors = parsed?.anchors;
-            if (!rawAnchors || !Array.isArray(rawAnchors)) {
-                xbLog.warn(MODULE_ID, `floor ${aiFloor} attempt ${attempt} 缺少有效 anchors，parsed=${previewText(JSON.stringify(parsed))}`);
-                if (attempt < RETRY_COUNT) {
-                    await sleep(RETRY_DELAY);
-                    continue;
-                }
-                return null;
-            }
+            const rawAnchors = payload.anchors;
 
             // 转换为 atom 存储格式（最多 2 个）
             const atoms = rawAnchors
@@ -295,7 +291,7 @@ async function extractAtomsForRoundWithRetry(userMessage, aiMessage, aiFloor, op
                 continue;
             }
             xbLog.error(MODULE_ID, `floor ${aiFloor} 失败`, e);
-            return null;
+            throw e;
         }
     }
 
