@@ -1575,7 +1575,7 @@
       "publicPath": "scripts/extensions/third-party/LittleWhiteBox/modules/story-summary/data/vector-store.js",
       "relativePath": "modules/story-summary/data/vector-store.js",
       "extension": ".js",
-      "sizeBytes": 36756
+      "sizeBytes": 37245
     },
     {
       "source": "littlewhitebox",
@@ -1771,7 +1771,7 @@
       "publicPath": "scripts/extensions/third-party/LittleWhiteBox/modules/story-summary/vector/storage/chunk-store.js",
       "relativePath": "modules/story-summary/vector/storage/chunk-store.js",
       "extension": ".js",
-      "sizeBytes": 11099
+      "sizeBytes": 11597
     },
     {
       "source": "littlewhitebox",

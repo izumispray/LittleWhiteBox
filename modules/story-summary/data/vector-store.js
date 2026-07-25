@@ -63,6 +63,14 @@ export function isVectorStoreAutoSaveEnabled() {
     return autoSaveEnabled;
 }
 
+// 数据集被外部原因失效（其他设备写入服务器新版本）时的通知钩子，
+// 由 chunk-store 接到召回运行时做缓存标脏（避免循环 import）
+let datasetInvalidationListener = null;
+
+export function setDatasetInvalidationListener(fn) {
+    datasetInvalidationListener = typeof fn === 'function' ? fn : null;
+}
+
 /** 当前 chat 的存档状态（供设置面板展示） */
 export function getVectorArchiveStatus(chatId) {
     const key = String(chatId || '');
@@ -890,6 +898,9 @@ async function revalidateLoadedDatasets(reason = 'focus') {
             if (ds.saveTimer) clearTimeout(ds.saveTimer);
             if (ds.retryTimer) clearTimeout(ds.retryTimer);
             datasets.delete(key);
+            try {
+                datasetInvalidationListener?.(key, reason);
+            } catch { /* 通知失败不影响失效本身 */ }
             xbLog.info(MODULE_ID, `服务器向量数据有更新（其他设备写入），失效本地数据集待重载: chat=${key} reason=${reason}`);
         }
     }

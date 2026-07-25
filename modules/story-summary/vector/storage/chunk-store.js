@@ -7,11 +7,18 @@ import {
     ensureDataset,
     markDatasetDirty,
     deleteDatasetEverywhere,
+    setDatasetInvalidationListener,
 } from '../../data/vector-store.js';
 import {
     applyRecallRuntimeMutationBestEffort,
     clearRecallRuntime,
 } from '../runtime/runtime.js';
+
+// 其他设备更新了服务器向量数据 → 本地数据集被失效重载时，
+// 召回运行时的常驻缓存也必须同步标脏，否则会一直用旧向量打分
+setDatasetInvalidationListener((chatId, reason) => {
+    applyRecallRuntimeMutationBestEffort(chatId, { type: `dataset-invalidated:${reason || 'server'}` });
+});
 
 // Chunk parameters
 export const CHUNK_MAX_TOKENS = 200;
