@@ -35,7 +35,10 @@ export function getEngineFingerprint(config) {
     const api = config?.embeddingApi || {};
     const provider = String(api.provider || 'siliconflow').toLowerCase();
     const model = String(api.model || 'BAAI/bge-m3').trim() || 'BAAI/bge-m3';
-    return `${provider}:${model}:1024`;
+    // 历史指纹尾巴固定为 1024（与实际维度无关的遗留标签）；
+    // 自定义维度用 d<dims> 与其区分，保证"同模型只改维度"也触发向量重建提示
+    const dims = Number(config?.embeddingDims) || 0;
+    return `${provider}:${model}:${dims > 0 ? `d${dims}` : 1024}`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

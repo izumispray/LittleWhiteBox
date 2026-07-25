@@ -762,6 +762,7 @@
             enabled: $('vector-enabled')?.checked || false,
             engine: 'online',
             autoArchive: $('vector-archive-toggle')?.checked !== false,
+            embeddingDims: Math.max(0, parseInt($('vector-embedding-dims')?.value, 10) || 0) || null,
             l0Concurrency: Math.max(1, Math.min(50, Number($('vector-l0-concurrency')?.value) || 10)),
             l0Api: getVectorApiConfig('l0'),
             embeddingApi: getVectorApiConfig('embedding'),
@@ -777,6 +778,8 @@
         $('vector-l0-concurrency').value = String(Math.max(1, Math.min(50, Number(cfg.l0Concurrency) || 10)));
         const archiveToggle = $('vector-archive-toggle');
         if (archiveToggle) archiveToggle.checked = cfg.autoArchive !== false;
+        const dimsInput = $('vector-embedding-dims');
+        if (dimsInput) dimsInput.value = cfg.embeddingDims || '';
         loadVectorApiConfig('l0', cfg.l0Api || {});
         loadVectorApiConfig('embedding', cfg.embeddingApi || {});
         loadVectorApiConfig('rerank', cfg.rerankApi || {});

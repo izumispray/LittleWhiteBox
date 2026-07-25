@@ -70,6 +70,11 @@ export function getKeyCount() {
 // Embedding
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Qwen3-Embedding 系列是指令感知模型：查询侧加任务指令可提升检索精度（官方约 1-5%），
+// 文档侧保持裸文本。指令内容一旦定下不要改动，否则查询与历史查询分布漂移。
+const QWEN3_EMBEDDING_RE = /qwen3[-_.\s]*embedding/i;
+const QUERY_INSTRUCT = 'Instruct: Given a roleplay chat query, retrieve relevant memories, scenes and events from the story history\nQuery: ';
+
 export async function embed(texts, options = {}) {
     if (!texts?.length) return [];
 
@@ -86,16 +91,21 @@ export async function embed(texts, options = {}) {
             String(apiCfg.url || `${BASE_URL}/v1`),
             getDefaultApiPrefix(apiCfg.provider || 'siliconflow')
         );
+        const model = String(apiCfg.model || EMBEDDING_MODEL);
+        const input = (options.isQuery && QWEN3_EMBEDDING_RE.test(model))
+            ? texts.map(t => QUERY_INSTRUCT + t)
+            : texts;
+        const body = { model, input };
+        // MRL 降维（Qwen3-Embedding 等支持）：默认不传，跟随模型原生维度
+        const dims = Number(getVectorConfig()?.embeddingDims) || 0;
+        if (dims > 0) body.dimensions = dims;
         const response = await fetch(`${baseUrl}/embeddings`, {
             method: 'POST',
             headers: {
                 'Authorization': `Bearer ${key}`,
                 'Content-Type': 'application/json',
             },
-            body: JSON.stringify({
-                model: String(apiCfg.model || EMBEDDING_MODEL),
-                input: texts,
-            }),
+            body: JSON.stringify(body),
             signal: signal || controller.signal,
         });
 

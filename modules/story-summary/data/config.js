@@ -381,6 +381,8 @@ function normalizeVectorConfig(rawVector = null) {
         enabled: !!rawVector?.enabled,
         engine: "online",
         autoArchive: rawVector?.autoArchive !== false,
+        // MRL 降维输出（0/null=不传，跟随模型默认维度）
+        embeddingDims: Math.max(0, Math.min(8192, Number(rawVector?.embeddingDims) || 0)) || null,
         l0Concurrency: Math.max(1, Math.min(50, Number(rawVector?.l0Concurrency) || 10)),
         l0Api: normalizeOpenAiCompatApiConfig(rawVector?.l0Api, {
             provider: sharedProvider,

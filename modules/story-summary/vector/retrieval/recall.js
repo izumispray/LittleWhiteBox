@@ -1258,13 +1258,13 @@ export async function recallMemory(allEvents, vectorConfig, options = {}) {
     recallPillStage('查询向量化');
     const T_R1_Embed_Start = performance.now();
     try {
-        r1Vectors = await embed(segmentTexts, vectorConfig, { timeout: 10000 });
+        r1Vectors = await embed(segmentTexts, vectorConfig, { timeout: 10000, isQuery: true });
     } catch (e1) {
         xbLog.warn(MODULE_ID, 'Round 1 向量化失败，500ms 后重试', e1);
         metrics.timing.round1EmbedRetryWait = 500;
         await new Promise(r => setTimeout(r, 500));
         try {
-            r1Vectors = await embed(segmentTexts, vectorConfig, { timeout: 15000 });
+            r1Vectors = await embed(segmentTexts, vectorConfig, { timeout: 15000, isQuery: true });
         } catch (e2) {
             xbLog.error(MODULE_ID, 'Round 1 向量化重试仍失败', e2);
             metrics.timing.round1Embed = Math.round(performance.now() - T_R1_Embed_Start);
@@ -1370,7 +1370,7 @@ export async function recallMemory(allEvents, vectorConfig, options = {}) {
         recallPillStage('二轮检索');
         const T_R2_Embed_Start = performance.now();
         try {
-            const [hintsVec] = await embed([bundle.hintsSegment.text], vectorConfig, { timeout: 10000 });
+            const [hintsVec] = await embed([bundle.hintsSegment.text], vectorConfig, { timeout: 10000, isQuery: true });
             metrics.timing.round2Embed = Math.round(performance.now() - T_R2_Embed_Start);
 
             if (hintsVec?.length) {
