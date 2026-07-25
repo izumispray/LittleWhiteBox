@@ -1638,7 +1638,7 @@
       "publicPath": "scripts/extensions/third-party/LittleWhiteBox/modules/story-summary/story-summary.js",
       "relativePath": "modules/story-summary/story-summary.js",
       "extension": ".js",
-      "sizeBytes": 122822
+      "sizeBytes": 126069
     },
     {
       "source": "littlewhitebox",
@@ -1729,7 +1729,7 @@
       "publicPath": "scripts/extensions/third-party/LittleWhiteBox/modules/story-summary/vector/retrieval/recall-status.js",
       "relativePath": "modules/story-summary/vector/retrieval/recall-status.js",
       "extension": ".js",
-      "sizeBytes": 3354
+      "sizeBytes": 4398
     },
     {
       "source": "littlewhitebox",

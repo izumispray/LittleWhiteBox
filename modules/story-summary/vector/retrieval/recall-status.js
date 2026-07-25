@@ -82,3 +82,26 @@ export function recallPillFinish(ok, extra = '') {
         hideTimer = null;
     }, ok ? HIDE_DELAY_OK_MS : HIDE_DELAY_FAIL_MS);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 发送链路阶段（召回完成后：ST 组装正文提示词 → 等待模型首个响应）
+// 复用同一个药丸元素，独立于召回周期
+// ═══════════════════════════════════════════════════════════════════════════
+
+export function sendPathPillShow(text) {
+    if (!hasDom()) return;
+    if (hideTimer) {
+        clearTimeout(hideTimer);
+        hideTimer = null;
+    }
+    const el = getPill();
+    el.textContent = `⏳ ${text}`;
+    el.style.color = '#e5e7eb';
+    el.style.opacity = '1';
+}
+
+export function sendPathPillHide() {
+    if (!hasDom()) return;
+    const el = document.getElementById(PILL_ID);
+    if (el) el.style.opacity = '0';
+}

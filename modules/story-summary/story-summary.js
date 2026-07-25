@@ -108,6 +108,7 @@ import {
 } from "./vector/storage/state-store.js";
 
 import { retainDatasets, deleteDatasetEverywhere, getVectorArchiveStatus, setVectorStoreAutoSave, flushDataset } from "./data/vector-store.js";
+import { sendPathPillShow, sendPathPillHide } from "./vector/retrieval/recall-status.js";
 import {
     clearRecallRuntime,
     getRecallRuntimeStats,
@@ -2927,6 +2928,82 @@ async function handleGenerationStarted(type, _params, isDryRun) {
     };
     timing.writePrompt = Math.round(performance.now() - T_WritePrompt);
     logTiming('injected');
+    startSendPathMonitor();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 发送链路监视：记忆注入完成后，正文提示词组装（ST 核心 + 其他扩展的
+// PROMPT_READY 钩子）到模型首个响应之间的耗时与主线程长任务归因。
+// 用于诊断"召回完成后页面仍卡一段"到底卡在哪个阶段。
+// ═══════════════════════════════════════════════════════════════════════════
+
+let sendPathMonitorActive = false;
+
+function startSendPathMonitor() {
+    if (sendPathMonitorActive) return;
+    const es = getContext()?.eventSource;
+    if (!es?.on || typeof es.removeListener !== 'function') return;
+    sendPathMonitorActive = true;
+
+    const t0 = performance.now();
+    const longTasks = [];
+    let observer = null;
+    try {
+        observer = new PerformanceObserver((list) => {
+            for (const entry of list.getEntries()) {
+                if (entry.duration >= 200) longTasks.push(Math.round(entry.duration));
+            }
+        });
+        observer.observe({ entryTypes: ['longtask'] });
+    } catch {
+        observer = null;
+    }
+
+    sendPathPillShow('组装正文提示词…');
+    let promptReadyAt = 0;
+    let safetyTimer = null;
+
+    const subscribed = [];
+    const listen = (type, handler) => {
+        if (!type) return;
+        es.on(type, handler);
+        subscribed.push([type, handler]);
+    };
+
+    const cleanup = () => {
+        sendPathMonitorActive = false;
+        if (safetyTimer) clearTimeout(safetyTimer);
+        try { observer?.disconnect(); } catch { /* 已断开 */ }
+        for (const [type, handler] of subscribed) {
+            try { es.removeListener(type, handler); } catch { /* 已移除 */ }
+        }
+    };
+
+    const onPromptReady = (data) => {
+        if (data?.dryRun) return;
+        promptReadyAt = performance.now();
+        sendPathPillShow('等待模型响应…');
+        xbLog.info(MODULE_ID, `[发送链路] 正文提示词组装 ${Math.round(promptReadyAt - t0)}ms 长任务≥200ms=[${longTasks.join(',')}]`);
+    };
+
+    const onFirstResponse = () => {
+        if (!sendPathMonitorActive) return;
+        const total = Math.round(performance.now() - t0);
+        const buildMs = promptReadyAt ? Math.round(promptReadyAt - t0) : null;
+        xbLog.info(MODULE_ID, `[发送链路] 首个响应: 注入后总计=${total}ms 组装=${buildMs ?? '?'}ms 长任务≥200ms=[${longTasks.join(',')}]`);
+        sendPathPillHide();
+        cleanup();
+    };
+
+    listen(event_types.CHAT_COMPLETION_PROMPT_READY, onPromptReady);
+    listen(event_types.STREAM_TOKEN_RECEIVED, onFirstResponse);
+    listen(event_types.MESSAGE_RECEIVED, onFirstResponse);
+    listen(event_types.GENERATION_STOPPED, onFirstResponse);
+
+    safetyTimer = setTimeout(() => {
+        sendPathPillHide();
+        cleanup();
+    }, 180000);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
