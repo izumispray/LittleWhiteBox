@@ -121,6 +121,11 @@ let lastError = null;
 const dirtyRefreshTimers = new Map();
 const dirtyChats = new Map();
 const activeSessionCounts = new Map();
+// 缓存常驻协议：warmChats 里的 chat 在 runtime 后端里已有可复用的热数据，
+// beginSession 无需重新构建/传输整份快照（除非又被标脏）
+const warmChats = new Set();
+// 真空数据集（无任何向量）：避免每次会话都触发"空 entry 自愈刷新"
+const emptyWarmChats = new Set();
 
 function hasBackendStarted() {
     return !!backend || !!backendInitPromise;
@@ -192,10 +197,13 @@ async function createWorkerBackend() {
         kind: 'worker',
         async call(type, payload, options = {}) {
             let finalPayload = payload;
-            // worker 不接触存储：会话/刷新请求由主线程附带数据快照
+            // worker 不接触存储：冷启动/数据脏时由主线程附带数据快照。
+            // 热且干净的会话跳过快照（复制+结构化克隆的代价随聊天长度线性增长）。
             if ((type === 'beginSession' || type === 'refresh') && payload?.chatId) {
-                const dataset = await getDatasetSnapshot(payload.chatId);
-                finalPayload = { ...payload, dataset };
+                if (type === 'refresh' || payload.needDataset !== false) {
+                    const dataset = await getDatasetSnapshot(payload.chatId);
+                    finalPayload = { ...payload, dataset };
+                }
             }
             return await rpc.call(type, finalPayload, {
                 timeoutMs: options.timeoutMs || WORKER_TIMEOUT_MS,
@@ -449,7 +457,7 @@ function createMainBackend() {
         return getEntry(chatId);
     }
 
-    async function beginSession(chatId, reason = 'recall') {
+    async function beginSession(chatId, reason = 'recall', { forceRefresh = false } = {}) {
         const key = normalizeChatId(chatId);
         if (!key) return null;
         const startedAt = performance.now();
@@ -463,14 +471,20 @@ function createMainBackend() {
         session.count++;
         session.leases.add(leaseId);
         try {
-            const entry = await ensureReady(key);
+            let entry;
+            if (forceRefresh) {
+                await refresh(key, `${reason}:force-refresh`);
+                entry = entries.get(key);
+            } else {
+                entry = await ensureReady(key);
+            }
             if (entry) {
                 entry.timings = {
                     ...(entry.timings || {}),
                     beginSessionTotalMs: Math.round(performance.now() - startedAt),
                 };
             }
-            logRuntimeInfo('main backend begin session', `chat=${key} lease=${leaseId} reason=${reason} active=${session.leases.size}`);
+            logRuntimeInfo('main backend begin session', `chat=${key} lease=${leaseId} reason=${reason} force=${forceRefresh ? 1 : 0} active=${session.leases.size}`);
             return { chatId: key, leaseId, ready: !!entry?.ready, startedAt: sessionStartedAt, stats: stats(entry) };
         } catch (error) {
             session.leases.delete(leaseId);
@@ -493,11 +507,8 @@ function createMainBackend() {
         session.leases.delete(leaseId);
         session.count = Math.max(0, session.count - 1);
         if (!session.count || !session.leases.size) {
+            // 缓存常驻：数据保留给下一次召回复用，逐出交给 retainOnly / clear
             sessionsByChatId.delete(key);
-            entries.delete(key);
-            const endSessionClearMs = Math.round(performance.now() - startedAt);
-            logRuntimeInfo('main backend end session cleared', `chat=${key} lease=${leaseId} clear=${endSessionClearMs}ms`);
-            return createIdleStats(key, { endSessionClearMs });
         }
         const entry = entries.get(key);
         if (entry) {
@@ -506,7 +517,7 @@ function createMainBackend() {
                 endSessionClearMs: Math.round(performance.now() - startedAt),
             };
         }
-        logRuntimeInfo('main backend end session retained', `chat=${key} lease=${leaseId} active=${session.leases.size}`);
+        logRuntimeInfo('main backend end session retained', `chat=${key} lease=${leaseId} active=${session?.leases?.size || 0}`);
         return entry ? stats(entry) : createIdleStats(key);
     }
 
@@ -563,7 +574,7 @@ function createMainBackend() {
                 case 'ping':
                     return { pong: true, backend: 'main-fallback' };
                 case 'beginSession':
-                    return await beginSession(payload.chatId, payload.reason);
+                    return await beginSession(payload.chatId, payload.reason, { forceRefresh: !!payload.forceRefresh });
                 case 'endSession':
                     return endSession(payload.lease);
                 case 'refresh':
@@ -753,15 +764,18 @@ async function callRuntime(type, payload = {}, options = {}) {
 
 export async function warmRecallRuntime(chatId, options = {}) {
     if (!chatId) return null;
-    logRuntimeInfo('warm request', `chat=${chatId} reason=${options.reason || 'warm'}`);
-    const stats = createSessionIdleStats(chatId, {
-        backend: backendKind,
-        status: 'session-cache idle',
-        skipped: true,
-        reason: options.reason || 'warm',
-    });
-    rememberStats(stats);
-    return { ready: false, skipped: true, stale: false, reason: options.reason || 'warm', stats };
+    const reason = options.reason || 'warm';
+    logRuntimeInfo('warm request', `chat=${chatId} reason=${reason}`);
+    try {
+        // 缓存常驻：begin+end 即完成预热，数据留在 runtime 后端里，
+        // 把装载/重建的代价移出发送消息的关键路径
+        const lease = await beginRecallRuntimeSession(chatId, { reason, timeoutMs: options.timeoutMs });
+        if (lease) await endRecallRuntimeSession(lease);
+        return { ready: !!lease?.ready, skipped: false, stale: false, reason, stats: lease?.stats || null };
+    } catch (error) {
+        logRuntimeWarn('warm failed', `chat=${chatId} err=${error?.message || error}`);
+        return { ready: false, skipped: false, stale: false, reason, error: error?.message || String(error) };
+    }
 }
 
 export async function refreshRecallRuntime(chatId, options = {}) {
@@ -798,8 +812,14 @@ export function markRecallRuntimeDirty(chatId, reason = 'dirty') {
     const key = normalizeChatId(chatId);
     if (!key) return;
     dirtyChats.set(key, { reason, updatedAt: Date.now() });
+    emptyWarmChats.delete(key);
     logRuntimeInfo('mark dirty', `chat=${key} reason=${reason}`);
     rememberStats(createSessionIdleStats(key, { dirtyReason: reason, dirtyAt: dirtyChats.get(key)?.updatedAt }));
+}
+
+function isEmptyRuntimeStats(stats) {
+    if (!stats) return true;
+    return ((stats.chunks || 0) + (stats.chunkVectors || 0) + (stats.eventVectors || 0) + (stats.stateVectors || 0)) === 0;
 }
 
 export async function beginRecallRuntimeSession(chatId, options = {}) {
@@ -807,11 +827,36 @@ export async function beginRecallRuntimeSession(chatId, options = {}) {
     if (!key) return null;
     const reason = options.reason || 'recall';
     const requestedAt = Date.now();
-    logRuntimeInfo('begin session request', `chat=${key} reason=${reason}`);
-    const result = await callRuntime('beginSession', { chatId: key, reason }, { timeoutMs: options.timeoutMs || SESSION_TIMEOUT_MS });
+    const dirty = dirtyChats.get(key);
+    // 热且干净 → 复用后端里的常驻数据，不重新构建/传输快照
+    const needDataset = !warmChats.has(key) || !!dirty;
+    logRuntimeInfo('begin session request', `chat=${key} reason=${reason} needDataset=${needDataset ? 1 : 0}${dirty ? ` dirty=${dirty.reason}` : ''}`);
+    let result = await callRuntime('beginSession', {
+        chatId: key,
+        reason,
+        needDataset,
+        forceRefresh: needDataset,
+    }, { timeoutMs: options.timeoutMs || SESSION_TIMEOUT_MS });
+
+    // 自愈：主线程以为后端还热着，但对方 entry 已被逐出并重建为空
+    if (result?.leaseId && !needDataset && isEmptyRuntimeStats(result.stats) && !emptyWarmChats.has(key)) {
+        logRuntimeWarn('begin session hit empty warm entry, refreshing with dataset', `chat=${key}`);
+        try {
+            const refreshed = await callRuntime('refresh', { chatId: key, reason: `${reason}:rewarm` }, { timeoutMs: options.timeoutMs || SESSION_TIMEOUT_MS });
+            if (refreshed?.stats) {
+                result = { ...result, ready: !!refreshed.ready, stats: refreshed.stats };
+            }
+            if (isEmptyRuntimeStats(refreshed?.stats)) emptyWarmChats.add(key);   // 真空数据集，别再刷了
+        } catch (error) {
+            logRuntimeWarn('rewarm refresh failed', `chat=${key} err=${error?.message || error}`);
+        }
+    } else if (result?.leaseId && needDataset && isEmptyRuntimeStats(result.stats)) {
+        emptyWarmChats.add(key);
+    }
+
     if (result?.leaseId) {
         rememberLocalSession(key);
-        const dirty = dirtyChats.get(key);
+        warmChats.add(key);
         if (dirty && dirty.updatedAt <= (result.startedAt || requestedAt)) {
             dirtyChats.delete(key);
         }
@@ -868,10 +913,14 @@ export async function clearRecallRuntime(chatId = null, domain = 'all') {
         if (timer) clearTimeout(timer);
         dirtyRefreshTimers.delete(chatId);
         dirtyChats.delete(String(chatId));
+        warmChats.delete(String(chatId));
+        emptyWarmChats.delete(String(chatId));
     } else {
         for (const timer of dirtyRefreshTimers.values()) clearTimeout(timer);
         dirtyRefreshTimers.clear();
         dirtyChats.clear();
+        warmChats.clear();
+        emptyWarmChats.clear();
     }
     if (!hasBackendStarted()) {
         if (chatId) {
@@ -891,6 +940,13 @@ export async function clearRecallRuntime(chatId = null, domain = 'all') {
 
 export async function retainRecallRuntimeOnly(chatId) {
     logRuntimeInfo('retainOnly request', `keep=${chatId || '*'}`);
+    const keep = normalizeChatId(chatId);
+    for (const key of [...warmChats]) {
+        if (!keep || key !== keep) warmChats.delete(key);
+    }
+    for (const key of [...emptyWarmChats]) {
+        if (!keep || key !== keep) emptyWarmChats.delete(key);
+    }
     if (!hasBackendStarted()) {
         const result = retainOnlyLastStats(chatId || null);
         logRuntimeInfo('retainOnly skipped (backend idle)', compactStatsList(result));

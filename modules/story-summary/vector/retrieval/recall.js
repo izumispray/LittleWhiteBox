@@ -51,6 +51,7 @@ import { getLexicalIndex, searchLexicalIndex } from './lexical-index.js';
 import { rerankChunks } from '../llm/reranker.js';
 import { createMetrics, calcSimilarityStats } from './metrics.js';
 import { tokenizeForIndex } from '../utils/tokenizer.js';
+import { recallPillStage, recallPillFinish } from './recall-status.js';
 
 const MODULE_ID = 'recall';
 
@@ -76,6 +77,10 @@ const CONFIG = {
     // Lexical Dense 门槛
     LEXICAL_EVENT_DENSE_MIN: 0.60,
     LEXICAL_FLOOR_DENSE_MIN: 0.50,
+
+    // Lexical 索引就绪等待上限：后台重建没完成就跳过本轮词法召回，
+    // 不为它同步等待全量重建（重建耗时随上下文长度增长）
+    LEXICAL_READY_WAIT_MS: 300,
 
     // W-RRF 融合（L0-only）
     RRF_K: 60,
@@ -1180,6 +1185,20 @@ export async function recallMemory(allEvents, vectorConfig, options = {}) {
 
     const snapshot = { chatId, meta: null, stateVectors: null };
 
+    let runtimeLease = null;
+    let leasePromise = null;
+    if (chatId) {
+        // 缓存常驻 + 并行装载：与查询向量化同时进行（热缓存时几乎瞬时返回）
+        leasePromise = beginRecallRuntimeSession(chatId, { reason: 'recallMemory' })
+            .catch((error) => {
+                xbLog.warn(MODULE_ID, 'Recall runtime begin session failed', error);
+                return null;
+            });
+    }
+
+    try {
+    recallPillStage('构建查询');
+
     // ═══════════════════════════════════════════════════════════════════
     // 阶段 1: Query Build
     // ═══════════════════════════════════════════════════════════════════
@@ -1236,6 +1255,7 @@ export async function recallMemory(allEvents, vectorConfig, options = {}) {
     }
 
     let r1Vectors;
+    recallPillStage('查询向量化');
     const T_R1_Embed_Start = performance.now();
     try {
         r1Vectors = await embed(segmentTexts, vectorConfig, { timeout: 10000 });
@@ -1298,17 +1318,16 @@ export async function recallMemory(allEvents, vectorConfig, options = {}) {
         };
     }
 
-    let runtimeLease = null;
     const T_Runtime_Begin_Start = performance.now();
-    if (chatId) {
-        runtimeLease = await beginRecallRuntimeSession(chatId, { reason: 'recallMemory' });
+    if (leasePromise) {
+        runtimeLease = await leasePromise;
         snapshot.meta = await getRecallRuntimeMeta(chatId);
         metrics.timing.runtimeLoadFromDB = runtimeLease?.stats?.timings?.loadFromDBMs ?? 0;
         metrics.timing.runtimeBuildEntry = runtimeLease?.stats?.timings?.buildEntryMs ?? 0;
     }
     metrics.timing.runtimeBeginSession = Math.round(performance.now() - T_Runtime_Begin_Start);
 
-    try {
+    recallPillStage('语义检索');
     const T_R1_Anchor_Start = performance.now();
     const { hits: anchorHits_v0 } = await recallAnchors(queryVector_v0, vectorConfig, null, snapshot);
     const r1AnchorTime = Math.round(performance.now() - T_R1_Anchor_Start);
@@ -1348,6 +1367,7 @@ export async function recallMemory(allEvents, vectorConfig, options = {}) {
     let queryVector_v1;
 
     if (bundle.hintsSegment) {
+        recallPillStage('二轮检索');
         const T_R2_Embed_Start = performance.now();
         try {
             const [hintsVec] = await embed([bundle.hintsSegment.text], vectorConfig, { timeout: 10000 });
@@ -1392,6 +1412,7 @@ export async function recallMemory(allEvents, vectorConfig, options = {}) {
     // 阶段 5: Lexical Retrieval + Dense-Gated Event Merge
     // ═══════════════════════════════════════════════════════════════════
 
+    recallPillStage('关键词检索');
     const T_Lex_Start = performance.now();
 
     let lexicalResult = {
@@ -1405,11 +1426,19 @@ export async function recallMemory(allEvents, vectorConfig, options = {}) {
     };
 
     let indexReadyTime = 0;
+    let lexicalSkippedNotReady = false;
     try {
         const T_Index_Ready = performance.now();
-        const index = await getLexicalIndex();
+        // 索引可能正被后台全量重建（耗时随上下文增长）：等待封顶，超时跳过本轮词法召回
+        const index = await Promise.race([
+            getLexicalIndex(),
+            new Promise((resolve) => setTimeout(() => resolve('__lex_timeout__'), CONFIG.LEXICAL_READY_WAIT_MS)),
+        ]);
         indexReadyTime = Math.round(performance.now() - T_Index_Ready);
-        if (index) {
+        if (index === '__lex_timeout__') {
+            lexicalSkippedNotReady = true;
+            xbLog.warn(MODULE_ID, `Lexical index not ready within ${CONFIG.LEXICAL_READY_WAIT_MS}ms; skipping lexical recall this round`);
+        } else if (index) {
             lexicalResult = await searchLexicalIndex(index, bundle.lexicalTerms);
         }
     } catch (e) {
@@ -1424,6 +1453,7 @@ export async function recallMemory(allEvents, vectorConfig, options = {}) {
         metrics.lexical.eventHits = lexicalResult.eventIds.length;
         metrics.lexical.searchTime = lexicalResult.searchTime || 0;
         metrics.lexical.indexReadyTime = indexReadyTime;
+        metrics.lexical.skippedNotReady = lexicalSkippedNotReady;
         metrics.lexical.terms = bundle.lexicalTerms.slice(0, 10);
         metrics.lexical.idfEnabled = !!lexicalResult.idfEnabled;
         metrics.lexical.idfDocCount = lexicalResult.idfDocCount || 0;
@@ -1489,6 +1519,7 @@ export async function recallMemory(allEvents, vectorConfig, options = {}) {
     // 阶段 6: Floor 粒度融合 + Rerank + L1 配对
     // ═══════════════════════════════════════════════════════════════════
 
+    recallPillStage('精排');
     const { l0Selected, l1ScoredByFloor, mustKeepFloors } = await locateAndPullEvidence(
         anchorHits,
         queryVector_v1,
@@ -1506,6 +1537,7 @@ export async function recallMemory(allEvents, vectorConfig, options = {}) {
     // consumed by prompt.js through the same budget pipeline.
     // ═══════════════════════════════════════════════════════════════════
 
+    recallPillStage('关联扩散');
     const diffusionResult = await diffuseRecallRuntimeL0(
         chatId,
         l0Selected,          // seeds (rerank-verified)
@@ -1581,6 +1613,7 @@ export async function recallMemory(allEvents, vectorConfig, options = {}) {
         `L0-linked events: ${recalledL0Floors.size} floors → ${l0LinkedCount} events linked (sim≥${CONFIG.LEXICAL_EVENT_DENSE_MIN})`
     );
 
+    recallPillStage('整理结果');
     const l1ByFloor = await buildL1PairsForSelectedFloors(
         l0Selected,
         queryVector_v1,
@@ -1650,7 +1683,14 @@ export async function recallMemory(allEvents, vectorConfig, options = {}) {
         elapsed: metrics.timing.total,
         metrics,
     };
+    } catch (error) {
+        recallPillFinish(false, String(error?.message || error).slice(0, 60));
+        throw error;
     } finally {
+        // 早退路径上 lease 可能还在装载途中，等它落地再释放
+        if (leasePromise && !runtimeLease) {
+            runtimeLease = await leasePromise;
+        }
         if (runtimeLease) {
             const T_Runtime_End_Start = performance.now();
             try {
@@ -1660,5 +1700,6 @@ export async function recallMemory(allEvents, vectorConfig, options = {}) {
             }
             metrics.timing.runtimeEndSession = Math.round(performance.now() - T_Runtime_End_Start);
         }
+        recallPillFinish(true, metrics.evidence?.rerankFailed ? '精排降级' : '');
     }
 }

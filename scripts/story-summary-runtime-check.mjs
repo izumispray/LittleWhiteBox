@@ -112,6 +112,18 @@ async function main() {
     runtimeModule.markRecallRuntimeDirty(chatId, 'runtime-check-during-session');
     const endStats = await endRecallRuntimeSession(lease);
     const dirtyStats = getRecallRuntimeStats().find((item) => item.chatId === chatId) || {};
+
+    // 缓存常驻协议：脏标记消费一轮后，未标脏的会话必须复用常驻数据，
+    // 标脏后的会话必须强制刷新拿到最新快照
+    await scoreRecallRuntimeL1(chatId, [1], [1, 0]);   // 消费 during-session 的脏标记
+    const dsMut = await ensureDataset(chatId);
+    dsMut.chunks.set('c-1-2', { chatId, chunkId: 'c-1-2', floor: 1, chunkIdx: 2, speaker: 'C', isUser: false, text: 'gamma memory', textHash: 'c' });
+    dsMut.chunkVectors.set('c-1-2', { chatId, chunkId: 'c-1-2', vector: float32ToBuffer([1, 0]), dims: 2, fingerprint: 'runtime-check' });
+    const staleL1 = await scoreRecallRuntimeL1(chatId, [1], [1, 0]);
+    const staleCount = (staleL1.get(1) || []).length;
+    runtimeModule.markRecallRuntimeDirty(chatId, 'runtime-check-mutation');
+    const freshL1 = await scoreRecallRuntimeL1(chatId, [1], [1, 0]);
+    const freshCount = (freshL1.get(1) || []).length;
     const offenders = await assertNoBusinessVectorCacheImports();
 
     const l1Stats = l1._stats || {};
@@ -122,7 +134,7 @@ async function main() {
     const scoreClose = (a, b) => Math.abs(Number(a || 0) - Number(b || 0)) < 1e-6;
 
     const checks = [
-        ['warmSkipped', !!warm?.skipped && !warmStats.chunkVectors && !warmStats.eventVectors && !warmStats.stateVectors],
+        ['warmLoadsData', !!warm?.ready && !warm?.skipped && warmStats.chunkVectors === 2 && warmStats.stateVectors === 1 && warmStats.eventVectors === 1],
         ['sessionReady', !!lease?.ready],
         ['l1TopChunk', top?.chunkId === 'c-1-0'],
         ['l1DbFallback', Number(l1Stats.cacheFallbackDbTime || 0) === 0],
@@ -131,8 +143,10 @@ async function main() {
         ['l1Exact', top?.chunkId === expectedL1[0]?.chunkId && scoreClose(top?._cosineScore, expectedL1[0]?._cosineScore)],
         ['diffusionSmoke', !!diffusion?.metrics],
         ['retainClearProtectActiveSession', top?.chunkId === 'c-1-0' && anchors?.scores?.length > 0 && events?.scores?.length > 0],
-        ['sessionReleased', endStats?.status === 'session-cache idle' && !endStats.chunkVectors && !endStats.eventVectors && !endStats.stateVectors],
+        ['sessionEndRetainsCache', endStats?.status === 'ready' && endStats.chunkVectors === 2 && endStats.stateVectors === 1],
         ['dirtyRetainedDuringSession', dirtyStats.dirtyReason === 'runtime-check-during-session'],
+        ['warmReuseWithoutDirty', staleCount === 2],
+        ['dirtyForcesRefresh', freshCount === 3],
         ['cacheOwner', ['worker', 'runtime-main'].includes(String(stats.owner || l1Stats.cacheOwner || ''))],
         ['noBusinessVectorCacheImports', offenders.length === 0],
     ];
@@ -144,12 +158,13 @@ async function main() {
 
     console.log('[story-summary-runtime]');
     console.log(`runtime backend=${backend}`);
-    console.log(`warm result=${warm?.skipped ? 'SKIPPED' : 'FAIL'} status=${warmStats.status || 'unknown'}`);
+    console.log(`warm result=${warm?.ready ? 'READY' : 'FAIL'} status=${warmStats.status || 'unknown'}`);
     console.log(`L0/L1/L2 cache owner=${cacheOwner}`);
     console.log(`DB fallback count=${Number(l1Stats.cacheFallbackDbTime || 0) === 0 ? 0 : 1}`);
     console.log(`promptParity=${promptParity}`);
-    console.log(`sessionRelease=${endStats?.status === 'session-cache idle' ? 'PASS' : 'FAIL'}`);
+    console.log(`sessionEndRetainsCache=${endStats?.status === 'ready' && endStats.chunkVectors === 2 ? 'PASS' : 'FAIL'}`);
     console.log(`dirtyDuringSession=${dirtyStats.dirtyReason === 'runtime-check-during-session' ? 'PASS' : 'FAIL'}`);
+    console.log(`cacheReuse=${staleCount === 2 ? 'PASS' : 'FAIL'} dirtyRefresh=${freshCount === 3 ? 'PASS' : 'FAIL'}`);
     console.log(`vectorCacheImports=${offenders.length ? `FAIL ${offenders.join(', ')}` : 'PASS'}`);
     console.log(`result=${failed.length ? 'FAIL' : 'PASS'}`);
 

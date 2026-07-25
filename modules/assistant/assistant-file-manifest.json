@@ -1726,10 +1726,17 @@
     },
     {
       "source": "littlewhitebox",
+      "publicPath": "scripts/extensions/third-party/LittleWhiteBox/modules/story-summary/vector/retrieval/recall-status.js",
+      "relativePath": "modules/story-summary/vector/retrieval/recall-status.js",
+      "extension": ".js",
+      "sizeBytes": 3354
+    },
+    {
+      "source": "littlewhitebox",
       "publicPath": "scripts/extensions/third-party/LittleWhiteBox/modules/story-summary/vector/retrieval/recall.js",
       "relativePath": "modules/story-summary/vector/retrieval/recall.js",
       "extension": ".js",
-      "sizeBytes": 74852
+      "sizeBytes": 76810
     },
     {
       "source": "littlewhitebox",
@@ -1743,14 +1750,14 @@
       "publicPath": "scripts/extensions/third-party/LittleWhiteBox/modules/story-summary/vector/runtime/runtime.js",
       "relativePath": "modules/story-summary/vector/runtime/runtime.js",
       "extension": ".js",
-      "sizeBytes": 38688
+      "sizeBytes": 41660
     },
     {
       "source": "littlewhitebox",
       "publicPath": "scripts/extensions/third-party/LittleWhiteBox/modules/story-summary/vector/runtime/runtime.worker.js",
       "relativePath": "modules/story-summary/vector/runtime/runtime.worker.js",
       "extension": ".js",
-      "sizeBytes": 22728
+      "sizeBytes": 23924
     },
     {
       "source": "littlewhitebox",

@@ -390,7 +390,7 @@ async function ensureReady(chatId) {
     return getEntry(chatId);
 }
 
-async function beginSession(chatId, reason = 'recall') {
+async function beginSession(chatId, reason = 'recall', { forceRefresh = false } = {}) {
     const key = normalizeChatId(chatId);
     if (!key) return null;
     const startedAt = performance.now();
@@ -404,14 +404,21 @@ async function beginSession(chatId, reason = 'recall') {
     session.count++;
     session.leases.add(leaseId);
     try {
-        const entry = await ensureReady(key);
+        let entry;
+        if (forceRefresh) {
+            // 主线程判定冷启动/数据已脏：随请求附带的快照必须生效
+            await refresh(key, `${reason}:force-refresh`);
+            entry = entries.get(key);
+        } else {
+            entry = await ensureReady(key);
+        }
         if (entry) {
             entry.timings = {
                 ...(entry.timings || {}),
                 beginSessionTotalMs: Math.round(performance.now() - startedAt),
             };
         }
-        logInfo('begin session', `chat=${key} lease=${leaseId} reason=${reason} active=${session.leases.size}`);
+        logInfo('begin session', `chat=${key} lease=${leaseId} reason=${reason} force=${forceRefresh ? 1 : 0} active=${session.leases.size}`);
         return { chatId: key, leaseId, ready: !!entry?.ready, startedAt: sessionStartedAt, stats: entryStats(entry) };
     } catch (error) {
         session.leases.delete(leaseId);
@@ -435,11 +442,9 @@ function endSession(lease = {}) {
     session.count = Math.max(0, session.count - 1);
     if (!session.count || !session.leases.size) {
         sessionsByChatId.delete(key);
-        entries.delete(key);
+        // 缓存常驻：数据保留给下一次召回复用（每次发消息重建整套数据的代价
+        // 随聊天长度线性增长）。逐出交给 retainOnly（切聊天）/ clear（清数据）。
         pendingDatasets.delete(key);
-        const endSessionClearMs = Math.round(performance.now() - startedAt);
-        logInfo('end session cleared', `chat=${key} lease=${leaseId} clear=${endSessionClearMs}ms`);
-        return createIdleStats(key, { endSessionClearMs });
     }
     const entry = entries.get(key);
     if (entry) {
@@ -448,7 +453,7 @@ function endSession(lease = {}) {
             endSessionClearMs: Math.round(performance.now() - startedAt),
         };
     }
-    logInfo('end session retained', `chat=${key} lease=${leaseId} active=${session.leases.size}`);
+    logInfo('end session retained', `chat=${key} lease=${leaseId} active=${session.leases?.size || 0}`);
     return entry ? entryStats(entry) : createIdleStats(key);
 }
 
@@ -536,7 +541,7 @@ async function handle(type, payload = {}) {
             return { pong: true, backend: 'worker' };
         case 'beginSession':
             stashDataset(payload.chatId, payload.dataset);
-            return await beginSession(payload.chatId, payload.reason);
+            return await beginSession(payload.chatId, payload.reason, { forceRefresh: !!payload.forceRefresh });
         case 'endSession':
             return endSession(payload.lease);
         case 'refresh':
