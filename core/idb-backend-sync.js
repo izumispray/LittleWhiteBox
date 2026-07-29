@@ -19,18 +19,22 @@ import { xbLog } from './debug-core.js';
 
 const MODULE_ID = 'idb-backend-sync';
 const FORMAT_VERSION = 1;
-const CYCLE_MS = 5 * 60 * 1000;
+// 后端是本机 TauriTavern，上传零成本。周期越短，"玩了还没备份就关页面"
+// 这个制造多设备分叉的窗口就越小。
+const CYCLE_MS = 60 * 1000;
 const INITIAL_DELAY_MS = 20 * 1000;
 const UPLOAD_TIMEOUT_MS = 120 * 1000;
+const RELOAD_MARK_KEY = 'LWB_IdbSyncReloadedAt';
 
 const SYNC_TARGETS = [
     { dbName: 'LittleWhiteBox_Assistant' },
     { dbName: 'LittleWhiteBox_Ebook' },
     { dbName: 'LittleWhiteBox_Tavern' },
-].map(t => ({ ...t, lastUploadedFingerprint: null, busy: false, warnedFirstRun: false }));
+].map(t => ({ ...t, lastUploadedFingerprint: null, busy: false, warnedFirstRun: false, notifiedStale: false, pendingFirstContact: false }));
 
 let started = false;
 let startupChecked = false;
+let needsReload = false;
 let cycleTimer = null;
 let onPageHide = null;
 let onVisibilityChange = null;
@@ -219,8 +223,13 @@ async function backupTarget(target, reason = 'cycle', { force = false } = {}) {
         // 防止盖掉其他设备刚写的快照：服务器版本超出本设备已知范围时暂停上传
         if (!force && marker?.serverFingerprint && serverMeta && serverMeta.fingerprint !== marker.serverFingerprint) {
             xbLog.warn(MODULE_ID, `${target.dbName} 服务器快照已被其他设备更新，本设备暂停上传（刷新页面以拉取最新数据）`);
+            if (!target.notifiedStale) {
+                target.notifiedStale = true;
+                try { toastr.info(`云端的 ${target.dbName.replace('LittleWhiteBox_', '')} 有更新，刷新页面即可拉取（本机改动在刷新前不会上传）`, '小白盒同步'); } catch { /* 忽略 */ }
+            }
             return;
         }
+        target.notifiedStale = false;
 
         const schema = buildSchemaSpec(db);
         const counts = {};
@@ -291,8 +300,12 @@ async function backupTarget(target, reason = 'cycle', { force = false } = {}) {
 // 每台设备在 localStorage 记一个同步标记 {localFingerprint, serverFingerprint}：
 // - 本地为空 + 后端有快照        → 全量恢复
 // - 服务器更新了、本地自上次同步没改 → 快进恢复（多设备切换的正常路径）
-// - 两边都改了 / 没有标记          → 本地优先并警告（周期备份会覆盖服务器）
+// - 没有标记（本设备首次接入）      → 本机为空则直接恢复；本机有数据则弹一次
+//                                  确认框选基准，取消就冻结 + 常驻提示
+// - 两边都改了（分叉）             → 冻结：谁也不覆盖谁，弹可点击通知交人裁决
 // - 备份前发现服务器被其他设备更新   → 暂停上传，避免盖掉别人的新数据
+//
+// 恢复动过表之后必须刷新页面：各模块的内存态还是旧数据，继续跑会写回覆盖。
 //
 // 快照不记录 schema 语义，只记 Dexie verno，所以跨版本一律拒绝而不是勉强合并：
 // - 恢复时 manifest.verno ≠ 本地 verno → 拒绝恢复（否则缺失的表被静默跳过）
@@ -432,24 +445,34 @@ async function syncTargetOnStartup(target) {
 
     const local = await inspectLocalDb(target.dbName);
     if (local.empty) {
-        await restoreFromServerSnapshot(target);
+        if (await restoreFromServerSnapshot(target)) needsReload = true;
         return;
     }
 
     const marker = readSyncMarker(target.dbName);
-    if (marker && serverMeta.fingerprint === marker.serverFingerprint) {
+
+    // 本设备从未同步过、而后端已有快照、且本机也有数据 → 两份数据只能留一份，
+    // 不能无确认地自动选边（TT-Sync 推拉顺序出岔子时会把基准搞反）。
+    // 记下来，由 runStartupCheck 汇总弹一次确认框（每台设备只有这一次）。
+    if (!marker) {
+        target.pendingFirstContact = true;
+        return;
+    }
+
+    if (serverMeta.fingerprint === marker.serverFingerprint) {
         // 服务器自上次同步没变：本地改没改交给周期备份判断
         target.lastUploadedFingerprint = marker.localFingerprint || null;
         return;
     }
-    if (marker && local.fingerprint && local.fingerprint === marker.localFingerprint) {
+    if (local.fingerprint && local.fingerprint === marker.localFingerprint) {
         // 服务器更新了而本地没改 → 快进到服务器版本（多设备切换的正常路径）
         xbLog.info(MODULE_ID, `${target.dbName} 服务器快照有更新且本地未改动，快进恢复`);
-        await restoreFromServerSnapshot(target, { clearFirst: true });
+        if (await restoreFromServerSnapshot(target, { clearFirst: true })) needsReload = true;
         return;
     }
-    // 两边都动过 / 没有同步标记：本地优先，周期备份会覆盖服务器快照
-    xbLog.warn(MODULE_ID, `${target.dbName} 本地与服务器快照分叉，本地优先（服务器版本将被覆盖）`);
+    // 两边都动过：不猜，保持现状并暂停上传，弹通知交人裁决
+    xbLog.warn(MODULE_ID, `${target.dbName} 本地与服务器快照分叉，两边都不动，等待用户处理`);
+    showChoiceNotice(target, '本机与云端的数据分叉，同步已暂停');
     target.lastUploadedFingerprint = null;
 }
 
@@ -540,6 +563,46 @@ export async function pushIdbToServer(which = 'all') {
         else failed.push(target.dbName);
     }
     return { ok: failed.length === 0, done, failed };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 选边裁决（无命令路径）
+//
+// 快照协议没有合并，两边都有数据时只能选边，而选边是人的决定。
+// 出现在两处：首次接入取消了确认框、以及两台设备都改过同一库（分叉）。
+// 弹常驻通知，点击后用系统对话框二选一。
+// ═══════════════════════════════════════════════════════════════════════════
+
+function showChoiceNotice(target, intro) {
+    const short = target.dbName.replace('LittleWhiteBox_', '');
+    try {
+        toastr.warning(
+            `${intro}（${short}）。点击此提示选择保留哪一边。`,
+            '小白盒同步',
+            { timeOut: 0, extendedTimeOut: 0, tapToDismiss: false, onclick: () => { void resolveDivergence(target); } },
+        );
+    } catch { /* toastr 不可用时只剩日志，同步保持冻结（安全方向） */ }
+}
+
+async function resolveDivergence(target) {
+    const short = target.dbName.replace('LittleWhiteBox_', '');
+    if (confirm(`用云端（另一台设备）的 ${short} 数据覆盖本机？\n\n确定 = 云端覆盖本机，本机这部分的改动丢弃，随后自动刷新页面\n取消 = 进入下一步（用本机覆盖云端）`)) {
+        const r = await pullIdbFromServer(target.dbName);
+        if (r.done.length) {
+            try { toastr.success('已从云端恢复，页面即将刷新', '小白盒同步'); } catch { /* 忽略 */ }
+            setTimeout(() => { try { location.reload(); } catch { /* 忽略 */ } }, 1500);
+        } else {
+            try { toastr.error(r.failed.join('、'), '恢复失败'); } catch { /* 忽略 */ }
+        }
+        return;
+    }
+    if (confirm(`反过来：用本机的 ${short} 覆盖云端？\n\n确定 = 本机覆盖云端，另一台设备下次启动会对齐到本机\n取消 = 两边都不动，同步保持暂停`)) {
+        const r = await pushIdbToServer(target.dbName);
+        try {
+            if (r.done.length) toastr.success('已用本机覆盖云端', '小白盒同步');
+            else toastr.error(r.failed.join('、'), '上传失败');
+        } catch { /* 忽略 */ }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -649,7 +712,55 @@ async function runStartupCheck() {
             xbLog.warn(MODULE_ID, `启动同步检查失败 ${target.dbName}: ${e?.message || e}`);
         }
     }
+
+    // 首次接入且本机有数据：一次确认框决定基准。取消则冻结 + 常驻提示，
+    // 之后随时可以点提示再处理（无标记时备份守卫会一直拦着上传，不会误覆盖）。
+    const pending = SYNC_TARGETS.filter(t => t.pendingFirstContact);
+    if (pending.length) {
+        const names = pending.map(t => t.dbName.replace('LittleWhiteBox_', '')).join('、');
+        let adopt = false;
+        try {
+            adopt = confirm(`【小白盒同步】云端已有另一台设备的数据快照（${names}），本机也有一份，两份只能留一份。\n\n确定 = 用云端覆盖本机（第二台设备上选这个），随后自动刷新页面\n取消 = 暂不处理，同步保持暂停（稍后可点右上角提示再选）`);
+        } catch { /* 无对话框环境：保持冻结 */ }
+        for (const target of pending) {
+            target.pendingFirstContact = false;
+            if (!adopt) {
+                showChoiceNotice(target, '本机与云端各有一份数据，同步已暂停');
+                continue;
+            }
+            if (target.busy) continue;
+            target.busy = true;
+            try {
+                if (await restoreFromServerSnapshot(target, { clearFirst: true })) needsReload = true;
+                else showChoiceNotice(target, '从云端恢复失败（版本不一致？），同步已暂停');
+            } finally {
+                target.busy = false;
+            }
+        }
+    }
+
     startupChecked = true;
+
+    // 恢复是在 tavern / assistant / ebook 底下换掉表的，它们的内存态已经陈旧，
+    // 继续用会把旧数据写回、覆盖刚拉下来的快照，所以必须刷新一次。
+    // sessionStorage 时间戳兜底：60 秒内最多刷一次，异常情况下不会无限转圈。
+    if (!needsReload) {
+        try { sessionStorage.removeItem(RELOAD_MARK_KEY); } catch { /* 忽略 */ }
+        return;
+    }
+    needsReload = false;
+    try {
+        const last = Number(sessionStorage.getItem(RELOAD_MARK_KEY) || 0);
+        if (Date.now() - last < 60 * 1000) {
+            xbLog.warn(MODULE_ID, '60 秒内已因同步刷新过，跳过自动刷新（数据已恢复，请手动刷新页面）');
+            return;
+        }
+        sessionStorage.setItem(RELOAD_MARK_KEY, String(Date.now()));
+    } catch { /* 隐私模式等场景拿不到 sessionStorage，照常刷新 */ }
+
+    xbLog.info(MODULE_ID, '已从后端快照对齐本机数据，页面即将刷新');
+    try { toastr.info('已从云端对齐本机数据，页面即将刷新', '小白盒同步'); } catch { /* 忽略 */ }
+    setTimeout(() => { try { location.reload(); } catch { /* 忽略 */ } }, 2000);
 }
 
 function scheduleCycle(delayMs) {
@@ -704,5 +815,6 @@ export function cleanupIdbBackendSync() {
     unregisterSlashCommand();
     try { delete window.xiaobaixIdbSync; } catch { /* 忽略 */ }
     startupChecked = false;
+    needsReload = false;
     started = false;
 }
