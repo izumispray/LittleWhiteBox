@@ -12,6 +12,9 @@
 import Dexie from '../libs/dexie.mjs';
 import { zipSync, unzipSync, strToU8, strFromU8 } from '../libs/fflate.mjs';
 import { getRequestHeaders } from '../../../../../script.js';
+import { SlashCommandParser } from '../../../../slash-commands/SlashCommandParser.js';
+import { SlashCommand } from '../../../../slash-commands/SlashCommand.js';
+import { ARGUMENT_TYPE, SlashCommandNamedArgument } from '../../../../slash-commands/SlashCommandArgument.js';
 import { xbLog } from './debug-core.js';
 
 const MODULE_ID = 'idb-backend-sync';
@@ -24,9 +27,10 @@ const SYNC_TARGETS = [
     { dbName: 'LittleWhiteBox_Assistant' },
     { dbName: 'LittleWhiteBox_Ebook' },
     { dbName: 'LittleWhiteBox_Tavern' },
-].map(t => ({ ...t, lastUploadedFingerprint: null, busy: false }));
+].map(t => ({ ...t, lastUploadedFingerprint: null, busy: false, warnedFirstRun: false }));
 
 let started = false;
+let startupChecked = false;
 let cycleTimer = null;
 let onPageHide = null;
 let onVisibilityChange = null;
@@ -176,7 +180,7 @@ async function uploadFile(name, uint8OrString) {
     }
 }
 
-async function backupTarget(target, reason = 'cycle') {
+async function backupTarget(target, reason = 'cycle', { force = false } = {}) {
     if (target.busy) return;
     target.busy = true;
     let db = null;
@@ -187,20 +191,33 @@ async function backupTarget(target, reason = 'cycle') {
         await db.open();
 
         const fingerprint = await computeFingerprint(db);
-        if (fingerprint === target.lastUploadedFingerprint) return;
+        if (!force && fingerprint === target.lastUploadedFingerprint) return;
 
         const serverMeta = await fetchServerMeta(target.dbName);
 
         // 版本守卫：后端快照来自更新的 schema 时，旧代码不得回写覆盖
         // （整库快照不认版本号，v26 快照被 v10 代码上传回去会丢掉 14 张新表）
+        // 这一条连 force 也不放行：旧 schema 覆盖新 schema 是唯一无法挽回的方向。
         if (serverMeta && Number.isFinite(serverMeta.verno) && serverMeta.verno > db.verno) {
-            xbLog.warn(MODULE_ID, `${target.dbName} 后端快照 schema 更新（v${serverMeta.verno} > 本地 v${db.verno}），本设备暂停上传（请先更新扩展代码）`);
+            xbLog.warn(MODULE_ID, `${target.dbName} 后端快照 schema 更新（v${serverMeta.verno} > 本地 v${db.verno}），拒绝上传（请先把本设备扩展代码更新到同一版本）`);
+            return;
+        }
+
+        const marker = readSyncMarker(target.dbName);
+
+        // 首次接入守卫：本设备从未同步过、而后端已有别的设备的快照。
+        // 此时自动上传等于用本机数据静默顶掉对方，必须由人来裁决。
+        // 这是个稳态条件（人不动就一直成立），所以只喊一次，免得每周期刷屏。
+        if (!force && serverMeta && !marker?.serverFingerprint) {
+            if (!target.warnedFirstRun) {
+                target.warnedFirstRun = true;
+                xbLog.warn(MODULE_ID, `${target.dbName} 后端已有快照但本设备无同步标记，拒绝自动上传。用 /xbidbsync 看差异，pull 拉取后端 / push 覆盖后端`);
+            }
             return;
         }
 
         // 防止盖掉其他设备刚写的快照：服务器版本超出本设备已知范围时暂停上传
-        const marker = readSyncMarker(target.dbName);
-        if (marker?.serverFingerprint && serverMeta && serverMeta.fingerprint !== marker.serverFingerprint) {
+        if (!force && marker?.serverFingerprint && serverMeta && serverMeta.fingerprint !== marker.serverFingerprint) {
             xbLog.warn(MODULE_ID, `${target.dbName} 服务器快照已被其他设备更新，本设备暂停上传（刷新页面以拉取最新数据）`);
             return;
         }
@@ -258,12 +275,14 @@ async function backupTarget(target, reason = 'cycle') {
             syncedAt: Date.now(),
         });
         xbLog.info(MODULE_ID, `已备份 ${target.dbName} → 后端 (${(zipData.byteLength / 1024).toFixed(0)}KB, reason=${reason})`);
+        return true;
     } catch (e) {
         xbLog.warn(MODULE_ID, `备份 ${target.dbName} 失败: ${e?.message || e}`);
     } finally {
         try { db?.close(); } catch { /* 已关闭 */ }
         target.busy = false;
     }
+    return false;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -435,19 +454,212 @@ async function syncTargetOnStartup(target) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 手动介入
+//
+// 自动路径刻意保守：拿不准就什么都不做、只告警。"用哪边的数据"这种裁决交给
+// 这里的显式操作，入口是 /xbidbsync 与 window.xiaobaixIdbSync。
+// 首次多设备接入、以及两边都改过之后的分叉，都靠这里收场。
+// ═══════════════════════════════════════════════════════════════════════════
+
+const DB_ALIASES = {
+    assistant: 'LittleWhiteBox_Assistant',
+    ebook: 'LittleWhiteBox_Ebook',
+    tavern: 'LittleWhiteBox_Tavern',
+};
+
+function resolveTargets(which) {
+    const key = String(which ?? 'all').trim().toLowerCase();
+    if (!key || key === 'all') return SYNC_TARGETS;
+    const dbName = DB_ALIASES[key] || key;
+    return SYNC_TARGETS.filter(t => t.dbName.toLowerCase() === dbName.toLowerCase());
+}
+
+async function inspectLocalVerbose(dbName) {
+    if (!(await Dexie.exists(dbName))) return { exists: false, verno: null, rows: null };
+    const db = new Dexie(dbName);
+    try {
+        await db.open();
+        let rows = 0;
+        for (const table of db.tables) rows += await table.count();
+        return { exists: true, verno: db.verno, rows };
+    } catch (e) {
+        return { exists: true, verno: null, rows: null, error: e?.message || String(e) };
+    } finally {
+        try { db.close(); } catch { /* 已关闭 */ }
+    }
+}
+
+export async function getIdbSyncStatus() {
+    const out = [];
+    for (const target of SYNC_TARGETS) {
+        const serverMeta = await fetchServerMeta(target.dbName);
+        const marker = readSyncMarker(target.dbName);
+        out.push({
+            dbName: target.dbName,
+            local: await inspectLocalVerbose(target.dbName),
+            server: serverMeta
+                ? { verno: serverMeta.verno ?? null, exportedAt: serverMeta.exportedAt ?? null }
+                : null,
+            inSync: !!(marker?.serverFingerprint && serverMeta && marker.serverFingerprint === serverMeta.fingerprint),
+        });
+    }
+    return out;
+}
+
+/** 用后端快照覆盖本地（丢弃本地差异）。调用方负责刷新页面。 */
+export async function pullIdbFromServer(which = 'all') {
+    const targets = resolveTargets(which);
+    if (!targets.length) return { ok: false, done: [], failed: [`未知的库: ${which}`] };
+
+    const done = [];
+    const failed = [];
+    for (const target of targets) {
+        if (target.busy) { failed.push(`${target.dbName}（正忙）`); continue; }
+        target.busy = true;
+        try {
+            if (await restoreFromServerSnapshot(target, { clearFirst: true })) done.push(target.dbName);
+            else failed.push(target.dbName);
+        } catch (e) {
+            failed.push(`${target.dbName}（${e?.message || e}）`);
+        } finally {
+            target.busy = false;
+        }
+    }
+    return { ok: failed.length === 0, done, failed };
+}
+
+/** 用本地覆盖后端快照（丢弃后端差异）。schema 版本更旧时仍会被拒。 */
+export async function pushIdbToServer(which = 'all') {
+    const targets = resolveTargets(which);
+    if (!targets.length) return { ok: false, done: [], failed: [`未知的库: ${which}`] };
+
+    const done = [];
+    const failed = [];
+    for (const target of targets) {
+        if (await backupTarget(target, 'manual-push', { force: true })) done.push(target.dbName);
+        else failed.push(target.dbName);
+    }
+    return { ok: failed.length === 0, done, failed };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 斜杠命令
+// ═══════════════════════════════════════════════════════════════════════════
+
+let registeredCommand = null;
+
+function formatStatus(rows) {
+    const lines = rows.map(r => {
+        const local = !r.local.exists
+            ? '本地无库'
+            : r.local.error
+                ? `本地打不开（${r.local.error}）`
+                : `本地 v${r.local.verno} / ${r.local.rows} 行`;
+        const server = r.server
+            ? `后端 v${r.server.verno ?? '?'}${r.server.exportedAt ? ' / ' + new Date(r.server.exportedAt).toLocaleString() : ''}`
+            : '后端无快照';
+        const flag = r.server ? (r.inSync ? '已同步' : '未同步') : '—';
+        return `${r.dbName}\n    ${local}｜${server}｜${flag}`;
+    });
+    return `IndexedDB 后端快照状态：\n${lines.join('\n')}\n\npull=用后端覆盖本地，push=用本地覆盖后端`;
+}
+
+function registerSlashCommand() {
+    if (registeredCommand) return;
+    try {
+        registeredCommand = SlashCommand.fromProps({
+            name: 'xbidbsync',
+            helpString: 'IndexedDB 后端快照同步。不带参数看状态；action=pull 用后端快照覆盖本地（成功后自动刷新页面）；action=push 用本地覆盖后端快照。db 可选 all/tavern/assistant/ebook。',
+            namedArgumentList: [
+                SlashCommandNamedArgument.fromProps({
+                    name: 'action',
+                    description: 'status（默认）/ pull / push',
+                    typeList: [ARGUMENT_TYPE.STRING],
+                    enumList: ['status', 'pull', 'push'],
+                }),
+                SlashCommandNamedArgument.fromProps({
+                    name: 'db',
+                    description: '目标库，默认全部',
+                    typeList: [ARGUMENT_TYPE.STRING],
+                    enumList: ['all', 'tavern', 'assistant', 'ebook'],
+                }),
+            ],
+            callback: async (args) => {
+                const action = String(args.action || 'status').trim().toLowerCase();
+                const which = String(args.db || 'all').trim().toLowerCase();
+
+                if (action === 'status' || !action) {
+                    return formatStatus(await getIdbSyncStatus());
+                }
+
+                if (action === 'pull') {
+                    const r = await pullIdbFromServer(which);
+                    if (!r.done.length) {
+                        return `未恢复任何库。失败/跳过：${r.failed.join('、') || '无可恢复目标'}\n（schema 版本不一致会被拒绝，先确认两台设备扩展代码同版本）`;
+                    }
+                    // 恢复后各模块的内存态已陈旧，继续用会把旧数据写回覆盖刚拉下来的快照
+                    setTimeout(() => { try { location.reload(); } catch { /* 忽略 */ } }, 1500);
+                    return `已用后端快照覆盖：${r.done.join('、')}${r.failed.length ? `｜失败：${r.failed.join('、')}` : ''}\n即将刷新页面…`;
+                }
+
+                if (action === 'push') {
+                    const r = await pushIdbToServer(which);
+                    return r.done.length
+                        ? `已用本地覆盖后端：${r.done.join('、')}${r.failed.length ? `｜失败：${r.failed.join('、')}` : ''}`
+                        : `未上传任何库。失败/跳过：${r.failed.join('、') || '无目标'}\n（本地整库为空、或后端 schema 版本更新时会被拒绝）`;
+                }
+
+                return `未知 action: ${action}（可用 status / pull / push）`;
+            },
+        });
+        SlashCommandParser.addCommandObject(registeredCommand);
+    } catch (e) {
+        xbLog.warn(MODULE_ID, `注册 /xbidbsync 失败: ${e?.message || e}`);
+        registeredCommand = null;
+    }
+}
+
+function unregisterSlashCommand() {
+    if (!registeredCommand) return;
+    try {
+        const map = SlashCommandParser.commands || {};
+        Object.keys(map).forEach(k => { if (map[k] === registeredCommand) delete map[k]; });
+    } catch { /* 忽略 */ }
+    registeredCommand = null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 调度
 // ═══════════════════════════════════════════════════════════════════════════
 
 async function backupAll(reason) {
+    // 启动检查跑完之前不许备份：那时 lastUploadedFingerprint 与同步标记都还没建立，
+    // 而且各模块可能仍在做 Dexie 版本升级，快照到的会是半迁移状态。
+    if (!startupChecked) return;
     for (const target of SYNC_TARGETS) {
         await backupTarget(target, reason);
     }
+}
+
+async function runStartupCheck() {
+    for (const target of SYNC_TARGETS) {
+        try {
+            await syncTargetOnStartup(target);
+        } catch (e) {
+            xbLog.warn(MODULE_ID, `启动同步检查失败 ${target.dbName}: ${e?.message || e}`);
+        }
+    }
+    startupChecked = true;
 }
 
 function scheduleCycle(delayMs) {
     if (cycleTimer) clearTimeout(cycleTimer);
     cycleTimer = setTimeout(async () => {
         cycleTimer = null;
+        // 启动检查刻意推迟到这里：tavern / assistant / ebook 与本模块在同一批
+        // moduleInits 里并发启动，立刻用第二个 Dexie 连接去开库会挡住它们的
+        // schema 升级（v10→v26），也可能快照到半迁移状态。
+        if (!startupChecked) await runStartupCheck();
         await backupAll('cycle');
         scheduleCycle(CYCLE_MS);
     }, delayMs);
@@ -456,14 +668,6 @@ function scheduleCycle(delayMs) {
 export async function initIdbBackendSync() {
     if (started) return;
     started = true;
-
-    for (const target of SYNC_TARGETS) {
-        try {
-            await syncTargetOnStartup(target);
-        } catch (e) {
-            xbLog.warn(MODULE_ID, `启动同步检查失败 ${target.dbName}: ${e?.message || e}`);
-        }
-    }
 
     scheduleCycle(INITIAL_DELAY_MS);
 
@@ -474,7 +678,14 @@ export async function initIdbBackendSync() {
     window.addEventListener('pagehide', onPageHide);
     document.addEventListener('visibilitychange', onVisibilityChange);
 
-    xbLog.info(MODULE_ID, `已启动（${SYNC_TARGETS.map(t => t.dbName).join(', ')}）`);
+    registerSlashCommand();
+    window.xiaobaixIdbSync = {
+        status: getIdbSyncStatus,
+        pull: pullIdbFromServer,
+        push: pushIdbToServer,
+    };
+
+    xbLog.info(MODULE_ID, `已启动（${SYNC_TARGETS.map(t => t.dbName).join(', ')}），手动介入用 /xbidbsync`);
 }
 
 export function cleanupIdbBackendSync() {
@@ -490,5 +701,8 @@ export function cleanupIdbBackendSync() {
         document.removeEventListener('visibilitychange', onVisibilityChange);
         onVisibilityChange = null;
     }
+    unregisterSlashCommand();
+    try { delete window.xiaobaixIdbSync; } catch { /* 忽略 */ }
+    startupChecked = false;
     started = false;
 }
