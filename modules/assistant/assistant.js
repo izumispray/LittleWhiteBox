@@ -20,6 +20,7 @@ import {
     LOOKUP_SCOPE_LOCAL,
     assertLookupScopePath,
     assertLookupScopePattern,
+    filterLookupFilesByPath,
     isLocalLookupTarget,
     normalizeLookupScope,
 } from "./shared/lookup-scope.js";
@@ -263,6 +264,7 @@ function buildRuntimeConfig() {
         currentPresetName: settings.currentPresetName || DEFAULT_PRESET_NAME,
         delegatePresetName: settings.delegatePresetName || settings.currentPresetName || DEFAULT_PRESET_NAME,
         delegateConfig: settings.delegateConfig || {},
+        delegateConfigured: settings.delegateConfigured === true,
         presetNames: Object.keys(settings.presets || {}),
         presets: settings.presets || {},
         tavilyApiKey: settings.tavilyApiKey || '',
@@ -1301,12 +1303,6 @@ function normalizeIndexedDirectoryPath(rawPath = '') {
     return normalized.endsWith('/') ? normalized : `${normalized}/`;
 }
 
-function scopeIndexedFilesByDirectory(files, rawPath = '') {
-    const directoryPath = normalizeIndexedDirectoryPath(rawPath);
-    if (!directoryPath) return files;
-    return files.filter((entry) => String(entry.publicPath || '').startsWith(directoryPath));
-}
-
 function buildDirectoryItems(files, directoryPath, localSources = localSourcesCache) {
     const normalizedPrefix = directoryPath.toLowerCase();
     const entryMap = new Map();
@@ -1455,7 +1451,7 @@ async function globFiles(args = {}, options = {}) {
     assertLookupScopePattern(pattern, scope);
     assertLookupScopePath(searchPath, scope);
     const files = getLookupIndexedFiles(manifest, options.localSources, scope);
-    const matched = scopeIndexedFilesByDirectory(files, searchPath)
+    const matched = filterLookupFilesByPath(files, searchPath)
         .filter((entry) => matchesGlob(entry.publicPath, entry.relativePath, matcher))
         .sort((a, b) => String(a.publicPath || '').localeCompare(String(b.publicPath || ''), 'zh-CN'));
 
@@ -2130,7 +2126,7 @@ async function grepFiles(args = {}, options = {}) {
     assertLookupScopePath(searchPath, scope);
     assertLookupScopePattern(include, scope);
     const files = getLookupIndexedFiles(manifest, options.localSources, scope);
-    const scopedFiles = scopeIndexedFilesByDirectory(files, searchPath);
+    const scopedFiles = filterLookupFilesByPath(files, searchPath);
     const fileMatcher = include ? compileGlobPattern(include) : null;
     const candidateFiles = fileMatcher
         ? scopedFiles.filter((entry) => matchesGlob(entry.publicPath, entry.relativePath, fileMatcher))
@@ -3621,6 +3617,9 @@ async function handleIframeMessage(event) {
                 delegateConfig: patch.delegateConfig && typeof patch.delegateConfig === 'object'
                     ? patch.delegateConfig
                     : current.delegateConfig,
+                delegateConfigured: typeof patch.delegateConfigured === 'boolean'
+                    ? patch.delegateConfigured
+                    : current.delegateConfigured,
                 presets: patch.presets && typeof patch.presets === 'object'
                     ? patch.presets
                     : current.presets,
