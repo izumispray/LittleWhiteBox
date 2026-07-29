@@ -19,9 +19,10 @@ import { xbLog } from './debug-core.js';
 
 const MODULE_ID = 'idb-backend-sync';
 const FORMAT_VERSION = 1;
-// 后端是本机 TauriTavern，上传零成本。周期越短，"玩了还没备份就关页面"
-// 这个制造多设备分叉的窗口就越小。
-const CYCLE_MS = 60 * 1000;
+// 后端是本机 TauriTavern，上传零成本，但应用一关是前后端一起死，关闭钩子
+// （pagehide）里的异步上传跑不完。所以靠高频周期把"玩了还没备份"的窗口
+// 压到十几秒：指纹检查很便宜（每表 count+lastKey），没变化就不上传。
+const CYCLE_MS = 15 * 1000;
 const INITIAL_DELAY_MS = 20 * 1000;
 const UPLOAD_TIMEOUT_MS = 120 * 1000;
 const RELOAD_MARK_KEY = 'LWB_IdbSyncReloadedAt';
@@ -38,6 +39,7 @@ let needsReload = false;
 let cycleTimer = null;
 let onPageHide = null;
 let onVisibilityChange = null;
+let onWindowBlur = null;
 
 function zipFilename(dbName) {
     return `LWB_IdbSync_${dbName}.zip`;
@@ -786,8 +788,12 @@ export async function initIdbBackendSync() {
     onVisibilityChange = () => {
         if (document.visibilityState === 'hidden') backupAll('hidden');
     };
+    // Tauri 关窗是前后端一起死，pagehide 来不及；blur 在焦点离开的瞬间还活着
+    // （切去 TT-Sync、伸手点关闭键之前），是关窗前最后一个可靠的备份时机。
+    onWindowBlur = () => { backupAll('blur'); };
     window.addEventListener('pagehide', onPageHide);
     document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('blur', onWindowBlur);
 
     registerSlashCommand();
     window.xiaobaixIdbSync = {
@@ -811,6 +817,10 @@ export function cleanupIdbBackendSync() {
     if (onVisibilityChange) {
         document.removeEventListener('visibilitychange', onVisibilityChange);
         onVisibilityChange = null;
+    }
+    if (onWindowBlur) {
+        window.removeEventListener('blur', onWindowBlur);
+        onWindowBlur = null;
     }
     unregisterSlashCommand();
     try { delete window.xiaobaixIdbSync; } catch { /* 忽略 */ }
