@@ -70,7 +70,7 @@
       "publicPath": "scripts/extensions/third-party/LittleWhiteBox/core/idb-backend-sync.js",
       "relativePath": "core/idb-backend-sync.js",
       "extension": ".js",
-      "sizeBytes": 18763
+      "sizeBytes": 20894
     },
     {
       "source": "littlewhitebox",

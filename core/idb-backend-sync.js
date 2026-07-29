@@ -28,6 +28,8 @@ const SYNC_TARGETS = [
 
 let started = false;
 let cycleTimer = null;
+let onPageHide = null;
+let onVisibilityChange = null;
 
 function zipFilename(dbName) {
     return `LWB_IdbSync_${dbName}.zip`;
@@ -187,14 +189,20 @@ async function backupTarget(target, reason = 'cycle') {
         const fingerprint = await computeFingerprint(db);
         if (fingerprint === target.lastUploadedFingerprint) return;
 
+        const serverMeta = await fetchServerMeta(target.dbName);
+
+        // 版本守卫：后端快照来自更新的 schema 时，旧代码不得回写覆盖
+        // （整库快照不认版本号，v26 快照被 v10 代码上传回去会丢掉 14 张新表）
+        if (serverMeta && Number.isFinite(serverMeta.verno) && serverMeta.verno > db.verno) {
+            xbLog.warn(MODULE_ID, `${target.dbName} 后端快照 schema 更新（v${serverMeta.verno} > 本地 v${db.verno}），本设备暂停上传（请先更新扩展代码）`);
+            return;
+        }
+
         // 防止盖掉其他设备刚写的快照：服务器版本超出本设备已知范围时暂停上传
         const marker = readSyncMarker(target.dbName);
-        if (marker?.serverFingerprint) {
-            const serverMeta = await fetchServerMeta(target.dbName);
-            if (serverMeta && serverMeta.fingerprint !== marker.serverFingerprint) {
-                xbLog.warn(MODULE_ID, `${target.dbName} 服务器快照已被其他设备更新，本设备暂停上传（刷新页面以拉取最新数据）`);
-                return;
-            }
+        if (marker?.serverFingerprint && serverMeta && serverMeta.fingerprint !== marker.serverFingerprint) {
+            xbLog.warn(MODULE_ID, `${target.dbName} 服务器快照已被其他设备更新，本设备暂停上传（刷新页面以拉取最新数据）`);
+            return;
         }
 
         const schema = buildSchemaSpec(db);
@@ -216,6 +224,13 @@ async function backupTarget(target, reason = 'cycle') {
             zipEntries[`tables/${table.name}.json`] = strToU8(JSON.stringify(encoded));
         }
 
+        // 空库不覆盖既有快照：跨版本恢复被拒后本地会停在空库，
+        // 此时上传等于把后端唯一一份数据抹掉。
+        if (serverMeta && Object.values(counts).every(c => c === 0)) {
+            xbLog.warn(MODULE_ID, `${target.dbName} 本地整库为空，拒绝覆盖后端已有快照`);
+            return;
+        }
+
         const manifest = {
             version: FORMAT_VERSION,
             dbName: target.dbName,
@@ -231,6 +246,7 @@ async function backupTarget(target, reason = 'cycle') {
         await uploadFile(zipFilename(target.dbName), zipData);
         await uploadFile(metaFilename(target.dbName), JSON.stringify({
             version: FORMAT_VERSION,
+            verno: db.verno,
             fingerprint,
             exportedAt: manifest.exportedAt,
         }));
@@ -258,6 +274,10 @@ async function backupTarget(target, reason = 'cycle') {
 // - 服务器更新了、本地自上次同步没改 → 快进恢复（多设备切换的正常路径）
 // - 两边都改了 / 没有标记          → 本地优先并警告（周期备份会覆盖服务器）
 // - 备份前发现服务器被其他设备更新   → 暂停上传，避免盖掉别人的新数据
+//
+// 快照不记录 schema 语义，只记 Dexie verno，所以跨版本一律拒绝而不是勉强合并：
+// - 恢复时 manifest.verno ≠ 本地 verno → 拒绝恢复（否则缺失的表被静默跳过）
+// - 上传时后端 verno > 本地 verno      → 拒绝上传（否则旧代码把新表整体抹掉）
 // ═══════════════════════════════════════════════════════════════════════════
 
 const SYNC_STATE_LS_KEY = 'LWB_IdbSyncState';
@@ -342,6 +362,14 @@ async function restoreFromServerSnapshot(target, { clearFirst = false } = {}) {
         } else {
             db.version(manifest.verno).stores(manifest.schema);
             await db.open();
+        }
+
+        // 版本守卫：schema 版本不一致就不恢复。
+        // 逐表 bulkPut 对"manifest 里有而本地没有的表"是静默跳过的，跨版本恢复
+        // 会得到半新半旧的撕裂库（如 v13 起 managerMessages 已删、v26 多出 14 张表）。
+        if (dbExists && db.verno !== manifest.verno) {
+            xbLog.warn(MODULE_ID, `拒绝跨 schema 版本恢复 ${target.dbName}：后端快照 v${manifest.verno} ≠ 本地 v${db.verno}（先让两端扩展代码版本一致）`);
+            return false;
         }
 
         let restoredRows = 0;
@@ -439,10 +467,12 @@ export async function initIdbBackendSync() {
 
     scheduleCycle(INITIAL_DELAY_MS);
 
-    window.addEventListener('pagehide', () => { backupAll('pagehide'); });
-    document.addEventListener('visibilitychange', () => {
+    onPageHide = () => { backupAll('pagehide'); };
+    onVisibilityChange = () => {
         if (document.visibilityState === 'hidden') backupAll('hidden');
-    });
+    };
+    window.addEventListener('pagehide', onPageHide);
+    document.addEventListener('visibilitychange', onVisibilityChange);
 
     xbLog.info(MODULE_ID, `已启动（${SYNC_TARGETS.map(t => t.dbName).join(', ')}）`);
 }
@@ -451,6 +481,14 @@ export function cleanupIdbBackendSync() {
     if (cycleTimer) {
         clearTimeout(cycleTimer);
         cycleTimer = null;
+    }
+    if (onPageHide) {
+        window.removeEventListener('pagehide', onPageHide);
+        onPageHide = null;
+    }
+    if (onVisibilityChange) {
+        document.removeEventListener('visibilitychange', onVisibilityChange);
+        onVisibilityChange = null;
     }
     started = false;
 }
