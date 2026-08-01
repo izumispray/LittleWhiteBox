@@ -5,6 +5,7 @@ export const TAVERN_PHONE_WALLET_APP_ID = 'wallet';
 export const TAVERN_PHONE_TASKS_APP_ID = 'tasks';
 export const TAVERN_PHONE_SHOP_APP_ID = 'shop';
 export const TAVERN_PHONE_BANK_APP_ID = 'bank';
+export const TAVERN_PHONE_PET_APP_ID = 'pet';
 
 export type TavernPhonePresentationMode = 'desktop-device' | 'mobile-fullscreen';
 
@@ -25,6 +26,8 @@ export interface TavernPhoneAppManifest {
     accent: string;
     rootPath: string;
     order: number;
+    /** Lets an app extend a fixed visual surface through the shared system bars. */
+    chromeTone?: 'dark';
 }
 
 export interface TavernPhoneAppDefinition extends TavernPhoneAppManifest {
@@ -42,7 +45,13 @@ export function defineTavernPhoneApps(
     const normalized = definitions.map((definition) => {
         const id = String(definition.id || '').trim();
         const rootPath = String(definition.rootPath || '').trim();
-        if (!id || !rootPath.startsWith('/') || !definition.component || !definition.iconComponent) {
+        if (
+            !id
+            || !rootPath.startsWith('/')
+            || !definition.component
+            || !definition.iconComponent
+            || (definition.chromeTone !== undefined && definition.chromeTone !== 'dark')
+        ) {
             throw new Error('invalid_phone_app_definition');
         }
         if (ids.has(id)) {throw new Error(`duplicate_phone_app_definition:${id}`);}

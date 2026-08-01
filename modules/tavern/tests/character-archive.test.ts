@@ -137,12 +137,12 @@ async function seedArchiveTasks(sessionId: string, prefix = 'archive') {
     const taskId = `${prefix}-published-task`;
     const boundary = await captureTavernTaskPhoneBoundary(sessionId);
     const listingBlueprints = [
-        ['E', 10, '替钟表匠送一枚停摆齿轮'],
-        ['D', 30, '查清夜班渡船少掉的一名乘客'],
-        ['C', 80, '护送一箱会模仿哭声的矿石'],
-        ['B', 180, '替死人签收一只封蜡箱'],
-        ['A', 420, '从无主领馆取回失踪印玺'],
-        ['S', 900, '阻止天空列车驶入废弃站台'],
+        ['禁忌', 'B', 180, '易介入', '现在就行', '替死人签收封蜡箱'],
+        ['接触', 'C', 80, '易介入', '任意时候', '护送哭泣的矿石'],
+        ['夹缝', 'B', 160, '易介入', '现在就行', '夜班渡船的空位'],
+        ['窥秘', 'C', 80, '中介入', '任意时候', '停摆齿轮的来历'],
+        ['掠夺', 'B', 140, '中介入', '特定时机：闭馆后', '无主领馆的印玺'],
+        ['怪癖', 'D', 30, '深介入', '特定时机：末班车前', '废站台的车票'],
     ] as const;
     await replaceTavernTaskBoard({
         sessionId,
@@ -150,19 +150,16 @@ async function seedArchiveTasks(sessionId: string, prefix = 'archive') {
         expectedRevision: 0,
         expectedEpoch: 1,
         boundary,
-        listings: listingBlueprints.map(([grade, reward, title], index) => ({
+        listings: listingBlueprints.map(([direction, grade, reward, posture, timing, title], index) => ({
             id: `${prefix}-listing-${index + 1}`,
             grade,
-            tags: index % 2 ? ['调查'] : ['委托'],
+            tags: [direction, index % 2 ? '调查' : '委托'],
+            posture,
             title,
-            issuer: {
-                id: `${prefix}-issuer-${index + 1}`,
-                name: `陌生委托人 ${index + 1}`,
-                description: '只在地下委托终端留下单向联络暗号。',
-            },
             hook: '委托表面简单，但有一条刻意被遮住的附注。',
             objective: `完成第 ${index + 1} 项可执行目标并带回可信结果。`,
             location: `旧城区 ${index + 1} 号节点`,
+            timing,
             risk: '不得把委托内容交给无关人物。',
             reward,
         })),
@@ -834,7 +831,9 @@ test('tavern character archive restore replaces only the current character and r
     const restoredTaskVersions = await tavernTaskVersionsTable.where('sessionId').equals(restoredA1).toArray();
     assert.equal(restoredTaskBoard?.generationId, 'archive-board-1');
     assert.equal(restoredTaskBoard?.listings.length, 6);
-    assert.equal(restoredTaskBoard?.listings[3]?.title, '替死人签收一只封蜡箱');
+    assert.equal(restoredTaskBoard?.listings[3]?.title, '停摆齿轮的来历');
+    assert.equal(restoredTaskBoard?.listings[3]?.posture, '中介入');
+    assert.equal(restoredTaskBoard?.listings[3]?.timing, '任意时候');
     assert.equal(restoredTaskVersions.length, 2);
     assert.equal(restoredTaskVersions.find((version) => version.currentMarker === TAVERN_TASK_CURRENT_MARKER)?.revision, 2);
     const restoredCurrentTask = restoredTaskVersions.find((version) => version.currentMarker === TAVERN_TASK_CURRENT_MARKER);
@@ -869,9 +868,13 @@ test('tavern character archive restore replaces only the current character and r
     assert.equal(result.selectedSessionId, restoredA2);
 });
 
-test('tavern character archive accepts only the current v7 protocol', async () => {
+test('tavern character archive accepts only the current v8 protocol', async () => {
     await seedArchiveSource();
     const { manifest, records } = await buildArchive('char-a', 500);
+    const retiredV7Manifest = {
+        ...manifest,
+        version: 7,
+    } as unknown as TavernCharacterArchiveManifest;
     const retiredV6Manifest = {
         ...manifest,
         version: 6,
@@ -885,9 +888,34 @@ test('tavern character archive accepts only the current v7 protocol', async () =
         version: 4,
     } as unknown as TavernCharacterArchiveManifest;
 
+    await assert.rejects(restoreFromRecords(retiredV7Manifest, records), /archive_version_unsupported:7/);
     await assert.rejects(restoreFromRecords(retiredV6Manifest, records), /archive_version_unsupported:6/);
     await assert.rejects(restoreFromRecords(retiredV5Manifest, records), /archive_version_unsupported:5/);
     await assert.rejects(restoreFromRecords(retiredV4Manifest, records), /archive_version_unsupported:4/);
+});
+
+test('tavern character archive deliberately excludes the global companion', async () => {
+    const { a1 } = await seedArchiveSource();
+    const { lureTavernPet } = await import('../shared/pet/pet-service');
+    const { createTavernPetSequenceRandomSource } = await import('../shared/pet/pet-random');
+    const { tavernPetCompanionTable } = await import('../shared/session-db');
+    await lureTavernPet({
+        sessionId: a1.id,
+        boundary: await captureTavernPhoneBoundary(a1.id),
+        actionId: 'archive-global-pet',
+        expectedRevision: 0,
+        expectedVersionId: '',
+    }, createTavernPetSequenceRandomSource([71, 0, 15, 15, 15]));
+    assert.equal((await tavernPetCompanionTable.get('companion'))?.id, 'companion');
+
+    const { manifest, records } = await buildArchive('char-a', 2_048);
+    assert.equal(manifest.version, 9);
+    assert.equal(records.some((record) => String(record.table).startsWith('pet')), false);
+
+    await db.delete();
+    await db.open();
+    await restoreFromRecords(manifest, records);
+    assert.equal(await tavernPetCompanionTable.get('companion'), undefined);
 });
 
 test('tavern character archive rejects broken task funding before promotion', async () => {

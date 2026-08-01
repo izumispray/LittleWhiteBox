@@ -4,12 +4,12 @@ import { EXT_FOLDER_ID, EXT_ID, extensionFolderPath } from "./core/constants.js"
 import { executeSlashCommand } from "./core/slash-command.js";
 import { EventCenter } from "./core/event-manager.js";
 import { initTasks } from "./modules/scheduled-tasks/scheduled-tasks.js";
-import { initMessagePreview, addHistoryButtonsDebounced } from "./modules/message-preview.js";
+import { initMessagePreview, addHistoryButtonsDebounced, configureMessagePreviewRuntime, removeOwnedHistoryButtons } from "./modules/message-preview.js";
 import { initImmersiveMode } from "./modules/immersive-mode.js";
-import { initTemplateEditor } from "./modules/template-editor/template-editor.js";
+import { hasActiveCustomTemplate, hasCustomTemplateForMessage, initTemplateEditor } from "./modules/template-editor/template-editor.js";
 import { initFourthWall, initFourthWallFloorTools, refreshFourthWallFloorTools, closeFourthWall, openFourthWall } from "./modules/fourth-wall/fourth-wall.js";
-import { initButtonCollapse } from "./widgets/button-collapse.js";
-import { initVariablesPanel, cleanupVariablesPanel } from "./modules/variables/variables-panel.js";
+import { configureButtonCollapseRuntime, initButtonCollapse } from "./widgets/button-collapse.js";
+import { initVariablesPanel, cleanupVariablesPanel, configureVariablesPanelRuntime } from "./modules/variables/variables-panel.js";
 import { initStreamingGeneration } from "./modules/streaming-generation.js";
 import { initVariablesCore, cleanupVariablesCore } from "./modules/variables/variables-core.js";
 import { initControlAudio } from "./modules/control-audio.js";
@@ -19,7 +19,7 @@ import {
     processExistingMessages,
     clearBlobCaches,
     renderHtmlInIframe,
-    shrinkRenderedWindowFull
+    shrinkRenderedWindowFull,
 } from "./modules/iframe-renderer.js";
 import { initVarCommands, cleanupVarCommands } from "./modules/variables/var-commands.js";
 import { initVareventEditor, cleanupVareventEditor } from "./modules/variables/varevent-editor.js";
@@ -33,13 +33,18 @@ import {
     clearSharedImageRequests as clearSharedImageRequestsRuntime,
     generateSharedImage as generateSharedImageRuntime,
 } from "./modules/draw/shared/generated-image-runtime.js";
-import "./modules/story-summary/story-summary.js";
-import "./modules/story-outline/story-outline.js";
+import { configureStorySummaryRuntime } from "./modules/story-summary/story-summary.js";
+import { configureStoryOutlineRuntime } from "./modules/story-outline/story-outline.js";
 import { initTts, cleanupTts } from "./modules/tts/tts.js";
 import { initEnaPlanner, cleanupEnaPlanner } from "./modules/ena-planner/ena-planner.js";
 import { initAssistant, cleanupAssistant } from "./modules/assistant/assistant.js";
 import { initEbook, cleanupEbook } from "./modules/ebook/ebook.js";
 import { initIdbBackendSync, cleanupIdbBackendSync } from "./core/idb-backend-sync.js";
+import {
+    activateTauriTavernChatSurface,
+    isTauriTavernChatSurfaceManaged,
+    lockTauriTavernChatSurfaceSettings,
+} from "./integrations/tauritavern-chat-surface/index.js";
 
 extension_settings[EXT_ID] = extension_settings[EXT_ID] || {
     enabled: true,
@@ -71,6 +76,16 @@ if (settings.dynamicPrompt && !settings.fourthWall) settings.fourthWall = settin
 settings.audio ||= {};
 settings.audio.enabled = true;
 settings.wrapperIframe = true;
+
+const CHAT_SURFACE_MANAGED = isTauriTavernChatSurfaceManaged();
+configureMessagePreviewRuntime({
+    ownsHistoryButtons: !CHAT_SURFACE_MANAGED,
+    supportsPreview: !CHAT_SURFACE_MANAGED,
+});
+configureVariablesPanelRuntime({ ownsMessageButtons: !CHAT_SURFACE_MANAGED });
+configureStorySummaryRuntime({ ownsMessageButtons: !CHAT_SURFACE_MANAGED });
+configureStoryOutlineRuntime({ enabled: !CHAT_SURFACE_MANAGED });
+configureButtonCollapseRuntime({ ownsMessageButtons: !CHAT_SURFACE_MANAGED });
 
 const DRAW_PROVIDER_VALUES = new Set(['disabled', 'novelai', 'sdwebui', 'comfyui']);
 let tavernModulePromise = null;
@@ -142,6 +157,15 @@ async function cleanupTavernSafely() {
 
 function normalizeDrawProvider(provider) {
     return DRAW_PROVIDER_VALUES.has(provider) ? provider : 'disabled';
+}
+
+export function activate() {
+    return activateTauriTavernChatSurface({
+        settings,
+        hasActiveCustomTemplate,
+        hasCustomTemplateForMessage,
+        isDrawProviderActive: () => normalizeDrawProvider(settings.drawProvider) !== 'disabled',
+    });
 }
 
 function migrateDrawProviderSettings(targetSettings) {
@@ -735,10 +759,11 @@ function cleanupAllResources() {
         } catch (e) { }
     });
     moduleCleanupFunctions.clear();
-    try {
-        cleanupRenderer();
-    } catch (e) { }
-    document.querySelectorAll('.memory-button, .mes_history_preview').forEach(btn => btn.remove());
+    if (!CHAT_SURFACE_MANAGED) {
+        try { cleanupRenderer(); } catch (e) { }
+    }
+    document.querySelectorAll('.memory-button').forEach(btn => btn.remove());
+    removeOwnedHistoryButtons();
     document.querySelectorAll('#message_preview_btn').forEach(btn => {
         if (btn instanceof HTMLElement) {
             btn.style.display = 'none';
@@ -815,6 +840,7 @@ function syncFeatureActionButtons() {
         drawButton.disabled = !isXiaobaixEnabled;
         drawButton.classList.toggle('disabled-action', !isXiaobaixEnabled);
     }
+    lockTauriTavernChatSurfaceSettings();
 }
 
 async function toggleAllFeatures(enabled) {
@@ -822,37 +848,39 @@ async function toggleAllFeatures(enabled) {
         toggleSettingsControls(true);
         try { window.XB_applyPrevStates && window.XB_applyPrevStates(); } catch (e) { }
         saveSettingsDebounced();
-        initRenderer();
+        if (!CHAT_SURFACE_MANAGED) initRenderer();
         try { initVarCommands(); } catch (e) { }
         try { initVareventEditor(); } catch (e) { }
         if (extension_settings[EXT_ID].tasks?.enabled) {
             await initTasks();
         }
         const moduleInits = [
-            { condition: extension_settings[EXT_ID].immersive?.enabled, init: initImmersiveMode },
-            { condition: extension_settings[EXT_ID].templateEditor?.enabled, init: initTemplateEditor },
+            { condition: !CHAT_SURFACE_MANAGED && extension_settings[EXT_ID].immersive?.enabled, init: initImmersiveMode },
+            { condition: !CHAT_SURFACE_MANAGED && extension_settings[EXT_ID].templateEditor?.enabled, init: initTemplateEditor },
             { condition: true, init: initControlAudio },
             { condition: extension_settings[EXT_ID].variablesPanel?.enabled, init: initVariablesPanel },
             { condition: extension_settings[EXT_ID].variablesCore?.enabled, init: initVariablesCore },
-            { condition: extension_settings[EXT_ID].tts?.enabled, init: initTts },
+            { condition: !CHAT_SURFACE_MANAGED && extension_settings[EXT_ID].tts?.enabled, init: initTts },
             { condition: extension_settings[EXT_ID].enaPlanner?.enabled, init: initEnaPlanner },
             { condition: true, init: initEbook },
             { condition: true, init: () => { void initTavernSafely(); } },
             { condition: true, init: initStreamingGeneration },
-            { condition: true, init: initButtonCollapse },
+            { condition: !CHAT_SURFACE_MANAGED, init: initButtonCollapse },
             { condition: true, init: () => { void initIdbBackendSync().catch(() => {}); } }
         ];
         moduleInits.forEach(({ condition, init }) => {
             if (condition) init();
         });
-        try {
-            await initActiveDrawProvider();
-        } catch (e) {
-            console.error('[LittleWhiteBox] 初始化画图 provider 失败:', e);
-        }
-        try { initFourthWallFloorTools(); } catch (e) { }
-        if (extension_settings[EXT_ID].fourthWall?.enabled) {
-            try { initFourthWall(); } catch (e) { }
+        if (!CHAT_SURFACE_MANAGED) {
+            try {
+                await initActiveDrawProvider();
+            } catch (e) {
+                console.error('[LittleWhiteBox] 初始化画图 provider 失败:', e);
+            }
+            try { initFourthWallFloorTools(); } catch (e) { }
+            if (extension_settings[EXT_ID].fourthWall?.enabled) {
+                try { initFourthWall(); } catch (e) { }
+            }
         }
         if (extension_settings[EXT_ID].preview?.enabled || extension_settings[EXT_ID].recorded?.enabled) {
             setTimeout(initMessagePreview, 200);
@@ -932,7 +960,7 @@ async function setupSettings() {
             { id: 'xiaobaix_preview_enabled', key: 'preview', init: initMessagePreview },
             { id: 'scheduled_tasks_enabled', key: 'tasks', init: initTasks },
             { id: 'xiaobaix_template_enabled', key: 'templateEditor', init: initTemplateEditor },
-            { id: 'xiaobaix_variables_panel_enabled', key: 'variablesPanel', init: initVariablesPanel },
+            { id: 'xiaobaix_variables_panel_enabled', key: 'variablesPanel', init: initVariablesPanel, cleanup: cleanupVariablesPanel },
             { id: 'xiaobaix_variables_core_enabled', key: 'variablesCore', init: initVariablesCore },
             { id: 'xiaobaix_story_summary_enabled', key: 'storySummary' },
             { id: 'xiaobaix_story_outline_enabled', key: 'storyOutline' },
@@ -940,7 +968,7 @@ async function setupSettings() {
             { id: 'xiaobaix_ena_planner_enabled', key: 'enaPlanner', init: initEnaPlanner },
         ];
 
-        moduleConfigs.forEach(({ id, key, init }) => {
+        moduleConfigs.forEach(({ id, key, init, cleanup }) => {
             $(`#${id}`).prop("checked", settings[key]?.enabled || false).on("change", async function () {
                 if (!isXiaobaixEnabled) return;
                 const enabled = $(this).prop('checked');
@@ -958,6 +986,7 @@ async function setupSettings() {
                     moduleCleanupFunctions.get(key)();
                     moduleCleanupFunctions.delete(key);
                 }
+                if (!enabled && cleanup) cleanup();
                 if (enabled && init) await init();
                 if (enabled && key === 'tts') {
                     try { refreshFourthWallFloorTools(); } catch { }
@@ -1085,6 +1114,7 @@ async function setupSettings() {
 
         $("#xiaobaix_render_enabled").prop("checked", settings.renderEnabled !== false).on("change", async function () {
             if (!isXiaobaixEnabled) return;
+            if (CHAT_SURFACE_MANAGED) return;
             const wasEnabled = settings.renderEnabled !== false;
             settings.renderEnabled = $(this).prop("checked");
             saveSettingsDebounced();
@@ -1110,6 +1140,7 @@ async function setupSettings() {
             .val(Number.isFinite(settings.maxRenderedMessages) ? settings.maxRenderedMessages : 5)
             .on("input change", function () {
                 if (!isXiaobaixEnabled) return;
+                if (CHAT_SURFACE_MANAGED) return;
                 const v = normalizeMaxRendered($(this).val());
                 $(this).val(v);
                 settings.maxRenderedMessages = v;
@@ -1120,6 +1151,7 @@ async function setupSettings() {
         $(document).off('click.xbreset', '#xiaobaix_reset_btn').on('click.xbreset', '#xiaobaix_reset_btn', async function (e) {
             e.preventDefault();
             e.stopPropagation();
+            if (CHAT_SURFACE_MANAGED) return;
             const MAP = {
                 recorded: 'xiaobaix_recorded_enabled',
                 immersive: 'xiaobaix_immersive_enabled',
@@ -1159,6 +1191,7 @@ async function setupSettings() {
             settings.audio.enabled = true;
             try { saveSettingsDebounced(); } catch (e) { }
         });
+        lockTauriTavernChatSurfaceSettings();
     } catch (err) { }
 }
 
@@ -1212,8 +1245,10 @@ function setupMenuTabs() {
     }, 300);
 }
 
-window.processExistingMessages = processExistingMessages;
-window.renderHtmlInIframe = renderHtmlInIframe;
+if (!CHAT_SURFACE_MANAGED) {
+    window.processExistingMessages = processExistingMessages;
+    window.renderHtmlInIframe = renderHtmlInIframe;
+}
 window.registerModuleCleanup = registerModuleCleanup;
 window.updateLittleWhiteBoxExtension = updateLittleWhiteBoxExtension;
 window.removeAllUpdateNotices = removeAllUpdateNotices;
@@ -1241,7 +1276,7 @@ jQuery(async () => {
 
         try { initControlAudio(); } catch (e) { }
 
-        if (isXiaobaixEnabled) {
+        if (isXiaobaixEnabled && !CHAT_SURFACE_MANAGED) {
             initRenderer();
         }
 
@@ -1273,27 +1308,29 @@ jQuery(async () => {
             }
 
             const moduleInits = [
-                { condition: settings.immersive?.enabled, init: initImmersiveMode },
-                { condition: settings.templateEditor?.enabled, init: initTemplateEditor },
+                { condition: !CHAT_SURFACE_MANAGED && settings.immersive?.enabled, init: initImmersiveMode },
+                { condition: !CHAT_SURFACE_MANAGED && settings.templateEditor?.enabled, init: initTemplateEditor },
                 { condition: settings.variablesPanel?.enabled, init: initVariablesPanel },
                 { condition: settings.variablesCore?.enabled, init: initVariablesCore },
-                { condition: settings.tts?.enabled, init: initTts },
+                { condition: !CHAT_SURFACE_MANAGED && settings.tts?.enabled, init: initTts },
                 { condition: settings.enaPlanner?.enabled, init: initEnaPlanner },
                 { condition: true, init: initEbook },
                 { condition: true, init: () => { void initTavernSafely(); } },
                 { condition: true, init: initStreamingGeneration },
-                { condition: true, init: initButtonCollapse },
+                { condition: !CHAT_SURFACE_MANAGED, init: initButtonCollapse },
                 { condition: true, init: () => { void initIdbBackendSync().catch(() => {}); } }
             ];
             moduleInits.forEach(({ condition, init }) => { if (condition) init(); });
-            try {
-                await initActiveDrawProvider();
-            } catch (e) {
-                console.error('[LittleWhiteBox] 初始化画图 provider 失败:', e);
-            }
-            try { initFourthWallFloorTools(); } catch (e) { }
-            if (settings.fourthWall?.enabled) {
-                try { initFourthWall(); } catch (e) { }
+            if (!CHAT_SURFACE_MANAGED) {
+                try {
+                    await initActiveDrawProvider();
+                } catch (e) {
+                    console.error('[LittleWhiteBox] 初始化画图 provider 失败:', e);
+                }
+                try { initFourthWallFloorTools(); } catch (e) { }
+                if (settings.fourthWall?.enabled) {
+                    try { initFourthWall(); } catch (e) { }
+                }
             }
 
             if (settings.preview?.enabled || settings.recorded?.enabled) {
@@ -1309,9 +1346,11 @@ jQuery(async () => {
             }
         }, 2000);
 
-        setInterval(() => {
-            if (isXiaobaixEnabled) processExistingMessages();
-        }, 30000);
+        if (!CHAT_SURFACE_MANAGED) {
+            setInterval(() => {
+                if (isXiaobaixEnabled) processExistingMessages();
+            }, 30000);
+        }
     } catch (err) { }
 });
 

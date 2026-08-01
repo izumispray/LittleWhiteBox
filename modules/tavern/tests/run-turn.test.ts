@@ -1,5 +1,5 @@
 import 'fake-indexeddb/auto';
-import test from 'node:test';
+import test, { after, before } from 'node:test';
 import assert from 'node:assert/strict';
 
 import db, {
@@ -12,6 +12,9 @@ import db, {
     listTavernManagerMemorySnapshots,
     listTavernManagerRuns,
     listTavernMessages,
+    tavernPetActionsTable,
+    tavernPetCompanionTable,
+    tavernPetJournalTable,
     updateTavernSessionState,
     updateTavernMessage,
 } from '../shared/session-db';
@@ -76,12 +79,41 @@ import { replaceTavernTaskBoard } from '../shared/tasks/task-board';
 import { acceptTavernTaskListing } from '../shared/tasks/task-service';
 import { TAVERN_TASK_TOOL_NAMES } from '../shared/tasks/task-tools';
 import type { TavernTaskListing, TavernTaskVersionRecord } from '../shared/tasks/task-types';
+import { ensureTavernEconomy } from '../shared/economy/economy-service';
+import { renderTavernPetInterferenceText } from '../shared/pet/pet-copy';
+import {
+    appendTavernPetTransitionInCurrentDbTransaction,
+    getTavernPetCompanionInCurrentDbTransaction,
+} from '../shared/pet/pet-service';
+import {
+    createTavernPetTestState,
+    seedTavernPetForTest,
+} from './pet-test-helpers';
 
 async function resetDb() {
     await waitForQueuedAcceptedTurnManagers();
     await db.delete();
     await db.open();
 }
+
+const originalConsoleInfo = console.info.bind(console);
+
+before(() => {
+    console.info = (...args: Parameters<typeof console.info>) => {
+        if (args[0] === '[小白酒馆] turn stage start' || args[0] === '[小白酒馆] turn stage end') {
+            return;
+        }
+        originalConsoleInfo(...args);
+    };
+});
+
+after(async () => {
+    try {
+        await waitForQueuedAcceptedTurnManagers();
+    } finally {
+        console.info = originalConsoleInfo;
+    }
+});
 
 function makeContextWindowMessage(order: number, role: string, content = `message-${order}`) {
     return {
@@ -137,26 +169,24 @@ function withDefaultNativePromptHooks<T extends XbTavernRunTurnInput | XbTavernS
 
 function runTurnTaskListings(): TavernTaskListing[] {
     const rows = [
-        ['E', 10],
-        ['D', 25],
-        ['C', 60],
-        ['B', 180],
-        ['A', 400],
-        ['S', 900],
+        ['禁忌', 'B', 150, '易介入', '现在就行'],
+        ['接触', 'C', 60, '易介入', '任意时候'],
+        ['夹缝', 'C', 100, '易介入', '现在就行'],
+        ['窥秘', 'C', 80, '中介入', '任意时候'],
+        ['掠夺', 'C', 100, '中介入', '特定时机：下课后'],
+        ['怪癖', 'D', 25, '深介入', '特定时机：入夜后'],
     ] as const;
-    return rows.map(([grade, reward], index) => ({
+    return rows.map(([direction, grade, reward, posture, timing], index) => ({
         id: `runtime-listing-${index + 1}`,
         grade,
-        tags: [`runtime-tag-${index + 1}`],
+        tags: [direction, `runtime-tag-${index + 1}`],
+        posture,
         title: `运行时委托 ${index + 1}`,
-        issuer: {
-            id: `runtime-issuer-${index + 1}`,
-            name: `陌生发布者 ${index + 1}`,
-            description: `发布者描述 ${index + 1}`,
-        },
         hook: `异常钩子 ${index + 1}`,
         objective: `完成运行时目标 ${index + 1}`,
+        requirements: `运行时要求 ${index + 1}`,
         location: `地点 ${index + 1}`,
+        timing,
         risk: `风险 ${index + 1}`,
         reward,
     }));
@@ -4396,10 +4426,160 @@ test('formal tasks enter both local and ST-native depth-1 prompts while board ca
     assert.equal(taskDepth?.depth, 1);
     assert.equal(taskDepth?.role, 'system');
     assert.match(String(taskDepth?.content || ''), /《运行时委托 3》/);
+    assert.match(String(taskDepth?.content || ''), /等级：C/);
+    assert.match(String(taskDepth?.content || ''), /标签：夹缝、runtime-tag-3/);
+    assert.doesNotMatch(String(taskDepth?.content || ''), /委托人|发布者|任务终端托管/);
+    assert.match(String(taskDepth?.content || ''), /缘由与线索：异常钩子 3/);
     assert.match(String(taskDepth?.content || ''), /完成运行时目标 3/);
+    assert.match(String(taskDepth?.content || ''), /要求：运行时要求 3/);
+    assert.match(String(taskDepth?.content || ''), /地点：地点 3/);
+    assert.match(String(taskDepth?.content || ''), /时机：现在就行/);
+    assert.match(String(taskDepth?.content || ''), /风险：风险 3/);
+    assert.match(String(taskDepth?.content || ''), /报酬：100 小白币/);
+    assert.match(String(taskDepth?.content || ''), /此前进展：已接取任务/);
     assert.match(result.buildSnapshot.rawMessagesJson, /<active_tasks>/);
     assert.match(result.requestSnapshot.rawRequestJson, /完成运行时目标 3/);
     assert.doesNotMatch(result.requestSnapshot.rawRequestJson, /完成运行时目标 1|完成运行时目标 2|完成运行时目标 4/);
+});
+
+test('global Pet interference enters ST-native simulation and turn depth prompts only at its source anchor', async () => {
+    await resetDb();
+    const preset = createDefaultXbTavernPreset();
+    const session = await createTavernSession({
+        title: 'Pet native prompt',
+        characterKey: 'char-pet-native-prompt',
+        characterName: 'Aster',
+        contextSnapshot: { character: { characterKey: 'char-pet-native-prompt', name: 'Aster' } },
+        presetId: preset.id,
+        presetName: preset.name,
+    });
+    await ensureTavernEconomy(session.id);
+    for (let order = 0; order <= 5; order += 1) {
+        await appendTavernMessage(session.id, {
+            role: order % 2 === 0 ? 'user' : 'assistant',
+            content: `Pet prompt history ${order}`,
+        });
+    }
+    await seedTavernPetForTest(session.id, createTavernPetTestState('adult'));
+    const injectedText = renderTavernPetInterferenceText('brief-glimpse');
+    const journal = {
+        detail: {
+            kind: 'event' as const,
+            eventId: 'brief-glimpse' as const,
+            renderedText: '它身上沾着一点不属于这个房间的灰。',
+            face: '(◕‿◕)',
+            motion: 'stare' as const,
+            injectedText,
+        },
+        coinDelta: 0,
+    };
+    await db.transaction(
+        'rw',
+        tavernPetCompanionTable,
+        tavernPetActionsTable,
+        tavernPetJournalTable,
+        async () => {
+            const current = await getTavernPetCompanionInCurrentDbTransaction();
+            if (!current) {throw new Error('pet_native_prompt_companion_missing');}
+            const state = structuredClone(current.state);
+            state.petTurn += 1;
+            await appendTavernPetTransitionInCurrentDbTransaction({
+                current,
+                actionId: 'pet-native-prompt-fixture',
+                sourceSessionId: session.id,
+                sourceTurn: 0,
+                sourceAnchorOrder: 5,
+                action: {
+                    kind: 'turn-advance',
+                    context: {
+                        sourceSessionId: session.id,
+                        sourceTurn: 0,
+                        sourceAnchorOrder: 5,
+                        petTurn: state.petTurn,
+                        recentExternalSpend: 0,
+                        playerBalance: 100,
+                        knownTargetName: '',
+                        evolutionRequestId: 'pet-native-prompt-evolution-1',
+                    },
+                    outcome: { eventId: 'brief-glimpse', journal },
+                },
+                state,
+                journal,
+            });
+        },
+    );
+
+    const nativeDepthPromptRuns: Array<Array<{
+        layer?: string;
+        depth?: number;
+        role?: string;
+        content?: string;
+    }>> = [];
+    await simulateXbTavernRequest({
+        sessionId: session.id,
+        agentConfig: {
+            currentPresetName: '酒馆 OpenAI',
+            presets: {
+                '酒馆 OpenAI': {
+                    provider: 'sillytavern-openai-compatible',
+                    modelConfigs: {
+                        'sillytavern-openai-compatible': { model: 'gpt-test' },
+                    },
+                },
+            },
+        },
+        contextSnapshot: session.contextSnapshot || {},
+        preset,
+        currentUserMessage: '继续。',
+        buildNativeChatPrompt: async (input) => {
+            nativeDepthPromptRuns.push(input.runtimeDepthPrompts);
+            return {
+                source: 'test-native-pet-prompt',
+                promptMessageCount: input[TAVERN_LOCAL_PROMPT_MESSAGES]?.length || 0,
+                messages: input[TAVERN_LOCAL_PROMPT_MESSAGES] || [],
+                currentUserMessageIndex: (input[TAVERN_LOCAL_PROMPT_MESSAGES] || []).findIndex((message) => (
+                    message.role === 'user' && message.content === input.currentUserMessage
+                )),
+            };
+        },
+    });
+    await runXbTavernTurn({
+        sessionId: session.id,
+        agentConfig: { provider: 'fake-provider', model: 'fake-model' },
+        contextSnapshot: session.contextSnapshot || {},
+        preset,
+        currentUserMessage: '继续。',
+        buildNativeChatPrompt: async (input) => {
+            nativeDepthPromptRuns.push(input.runtimeDepthPrompts);
+            return {
+                source: 'test-native-pet-turn-prompt',
+                promptMessageCount: input[TAVERN_LOCAL_PROMPT_MESSAGES]?.length || 0,
+                messages: input[TAVERN_LOCAL_PROMPT_MESSAGES] || [],
+                currentUserMessageIndex: (input[TAVERN_LOCAL_PROMPT_MESSAGES] || []).findIndex((message) => (
+                    message.role === 'user' && message.content === input.currentUserMessage
+                )),
+            };
+        },
+        executeRunOnce: async (options: TavernRunOnceOptions) => ({
+            text: '继续。',
+            provider: 'fake-provider',
+            model: 'fake-model',
+            finishReason: 'stop',
+            requestSnapshot: buildTavernRequestSnapshot(options.agentConfig, options.messages, {
+                provider: 'fake-provider',
+                model: 'fake-model',
+            }),
+        }),
+    });
+
+    assert.equal(nativeDepthPromptRuns.length, 2);
+    for (const nativeDepthPrompts of nativeDepthPromptRuns) {
+        const petDepth = nativeDepthPrompts.find((entry) => entry.layer === 'runtime-pet-interference');
+        assert.equal(petDepth?.depth, 1);
+        assert.equal(petDepth?.role, 'system');
+        assert.match(String(petDepth?.content || ''), /<pet_interference>/);
+        assert.ok(String(petDepth?.content || '').includes(injectedText));
+    }
 });
 
 test('xb tavern world entry substitution skips null worldbook records', async () => {

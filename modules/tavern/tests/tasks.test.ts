@@ -21,6 +21,7 @@ import { replaceTavernTaskBoard as replaceTavernTaskBoardRaw } from '../shared/t
 import {
     acceptTavernTaskListing as acceptTavernTaskListingRaw,
     applyTavernTaskStagedAction,
+    buildTavernTaskCounterpartyAccountId,
     cancelTavernTask as cancelTavernTaskRaw,
     commitTavernTaskStagingContext,
     completeTavernTask as completeTavernTaskRaw,
@@ -40,6 +41,7 @@ import {
     restoreTavernAcceptedEconomicStateToFloor,
 } from '../shared/accepted-economic-state';
 import {
+    TAVERN_TASK_PROGRESS_SUMMARY_MAX_LENGTH,
     parseTavernTaskBoardResponse,
     parseTavernTaskCandidatesResponse,
     type TavernTaskExpectedPhoneBoundary,
@@ -181,26 +183,23 @@ async function failTavernTask(input: OptionalVersionId<Parameters<typeof failTav
 
 function boardListings(): TavernTaskListing[] {
     const rows = [
-        ['E', 10],
-        ['D', 25],
-        ['C', 60],
-        ['B', 180],
-        ['A', 400],
-        ['S', 900],
+        ['禁忌', 'B', 150, '易介入', '现在就行'],
+        ['接触', 'C', 60, '易介入', '任意时候'],
+        ['夹缝', 'C', 100, '易介入', '现在就行'],
+        ['窥秘', 'C', 80, '中介入', '任意时候'],
+        ['掠夺', 'C', 100, '中介入', '特定时机：下课后'],
+        ['怪癖', 'D', 25, '深介入', '特定时机：入夜后'],
     ] as const;
-    return rows.map(([grade, reward], index) => ({
+    return rows.map(([direction, grade, reward, posture, timing], index) => ({
         id: `listing-${index + 1}`,
         grade,
-        tags: [`tag-${index + 1}`],
+        tags: [direction, `tag-${index + 1}`],
+        posture,
         title: `委托 ${index + 1}`,
-        issuer: {
-            id: `issuer-${index + 1}`,
-            name: `陌生发布者 ${index + 1}`,
-            description: `发布者描述 ${index + 1}`,
-        },
         hook: `异常钩子 ${index + 1}`,
         objective: `完成目标 ${index + 1}`,
         location: `地点 ${index + 1}`,
+        timing,
         risk: `风险 ${index + 1}`,
         reward,
     }));
@@ -279,14 +278,17 @@ test('task requests use the new direction recipe only for board generation', () 
     ['standoff', 'dirty', 'escort', 'investigate', 'compete', 'absurd'].forEach((legacyKey) => {
         assert.equal(boardRequest.includes(legacyKey), false);
     });
-    assert.equal(boardRequest.includes('扒 <setting>'), true);
+    assert.equal(boardRequest.includes('玩家必须亲自打字完成转时、换地点、认识人物和建立氛围'), true);
+    assert.equal(boardRequest.includes('易介入 3 条、中介入 2 条、深介入 1 条'), true);
+    assert.equal(boardRequest.includes('posture 只能是易介入、中介入、深介入'), true);
+    assert.equal(boardRequest.includes('易介入禁止特定时机'), true);
     assert.equal(boardRequest.includes('第 1 层'), false);
     assert.equal(boardRequest.includes('第1层'), false);
     assert.equal(boardRequest.includes('tags 的第一项必须严格对应本条方向'), true);
     assert.equal(boardRequest.includes('tasks 必须是数组'), true);
-    assert.equal(boardRequest.includes('tags 必须是字符串数组'), true);
+    assert.equal(boardRequest.includes('tags 必须是含 1~4 项的字符串数组'), true);
     assert.equal(boardRequest.includes('reward 必须是正整数 JSON 数字，不得写成字符串'), true);
-    assert.equal(boardRequest.includes('不可用作发布者'), false);
+    assert.equal(boardRequest.includes('"issuer"'), false);
 
     assert.equal(candidateRequest.includes('## 第一步：读懂委托'), true);
     assert.equal(candidateRequest.includes('低报酬、高风险或条件苛刻的任务可以无人应征'), true);
@@ -364,10 +366,10 @@ test('task generation scans through the latest AI and preserves character and na
     assert.equal(JSON.stringify(nativeWorldbookInput?.context.history).includes('TASK_STORY_LATEST_AI'), true);
 });
 
-test('task response parsing keeps valid paid output without confusing business variance with invalid JSON', () => {
-    const response = `prefix\n${JSON.stringify({ tasks: boardListings().map(({ id: _id, issuer, ...listing }) => ({
+test('task response parsing keeps valid paid output without inventing a publisher', () => {
+    const response = `prefix\n${JSON.stringify({ tasks: boardListings().map(({ id: _id, ...listing }, index) => ({
         ...listing,
-        issuer: { name: issuer.name, description: issuer.description },
+        ...(index === 1 ? { issuer: { name: '模型擅自生成的发布者', description: '不应进入委托。' } } : {}),
     })) })}\nsuffix`;
     let id = 0;
     const listings = parseTavernTaskBoardResponse(response, {
@@ -375,11 +377,35 @@ test('task response parsing keeps valid paid output without confusing business v
     });
     assert.equal(listings.length, 6);
     assert.equal(new Set(listings.map((listing) => listing.id)).size, 6);
-    assert.equal(listings.some((listing) => listing.issuer.name === '陌生发布者 2'), true);
+    assert.equal(listings.some((listing) => 'issuer' in listing), false);
+    const shuffled = parseTavernTaskBoardResponse(JSON.stringify({
+        tasks: [...boardListings().slice(3), ...boardListings().slice(0, 3)],
+    }), { warn: () => undefined });
+    assert.deepEqual(shuffled.map((listing) => listing.tags[0]), ['禁忌', '接触', '夹缝', '窥秘', '掠夺', '怪癖']);
 
+    const warnings: string[] = [];
     const invalidReward = response.replace('"reward":60', '"reward":101');
-    assert.equal(parseTavernTaskBoardResponse(invalidReward).length, 5);
-    assert.equal(parseTavernTaskBoardResponse(JSON.stringify({ tasks: boardListings().slice(0, 5) })).length, 5);
+    assert.equal(parseTavernTaskBoardResponse(invalidReward, { warn: (warning) => warnings.push(warning) }).length, 5);
+    assert.equal(warnings.some((warning) => warning.startsWith('task_board_listing_dropped:index=2:')), true);
+    assert.equal(warnings.some((warning) => warning.startsWith('task_board_posture_quota_mismatch:')), true);
+    const stringReward = response.replace('"reward":60', '"reward":"60"');
+    assert.equal(parseTavernTaskBoardResponse(stringReward, { warn: () => undefined }).length, 5);
+    assert.equal(parseTavernTaskBoardResponse(JSON.stringify({
+        tasks: boardListings().map((listing, index) => index === 0
+            ? { ...listing, objective: 123 }
+            : listing),
+    }), { warn: () => undefined }).length, 5);
+    assert.equal(parseTavernTaskBoardResponse(JSON.stringify({
+        tasks: boardListings().map((listing, index) => index === 0
+            ? { ...listing, timing: '特定时机：三天后' }
+            : listing),
+    }), { warn: () => undefined }).length, 5);
+    assert.equal(parseTavernTaskBoardResponse(JSON.stringify({
+        tasks: boardListings().map((listing, index) => index === 0
+            ? { ...listing, title: '超过十二个字的任务标题必须被单独丢弃' }
+            : listing),
+    }), { warn: () => undefined }).length, 5);
+    assert.equal(parseTavernTaskBoardResponse(JSON.stringify({ tasks: boardListings().slice(0, 5) }), { warn: () => undefined }).length, 5);
 
     const withTrailingComma = `${JSON.stringify({ tasks: boardListings().slice(0, 1) }).slice(0, -1)},}`;
     assert.equal(parseTavernTaskBoardResponse(withTrailingComma).length, 1);
@@ -586,10 +612,7 @@ test('task board persists distinct listings when display titles repeat', async (
     await db.delete();
     await db.open();
     const session = await createTavernSession({ title: 'Task board duplicate display titles' });
-    const generated = boardListings().map(({ id: _id, issuer, ...listing }) => ({
-        ...listing,
-        issuer: { name: issuer.name, description: issuer.description },
-    }));
+    const generated = boardListings().map(({ id: _id, ...listing }) => listing);
     generated[5] = { ...generated[5], title: ` ${generated[0].title} ` };
     const listings = parseTavernTaskBoardResponse(JSON.stringify({ tasks: generated }));
 
@@ -772,9 +795,15 @@ test('accepting a listing atomically locks world money without mutating the boar
     const accepted = await acceptTavernTaskListing(input);
     const replay = await acceptTavernTaskListing(input);
     assert.equal(replay.actionId, accepted.actionId);
+    assert.equal(accepted.progressSummary, '已接取任务');
+    assert.equal(accepted.posture, '易介入');
+    assert.equal(accepted.timing, '现在就行');
     assert.equal(await getTavernTaskPlayerBalance(session.id), 100);
-    assert.equal((await tavernEconomyAccountsTable.get([session.id, accepted.escrowAccountId]))?.balance, 60);
-    assert.equal((await tavernEconomyAccountsTable.get([session.id, 'counterparty:issuer-3']))?.balance, -60);
+    assert.equal((await tavernEconomyAccountsTable.get([session.id, accepted.escrowAccountId]))?.balance, 100);
+    assert.equal((await tavernEconomyAccountsTable.get([
+        session.id,
+        buildTavernTaskCounterpartyAccountId(accepted.issuer.id),
+    ]))?.balance, -100);
     assert.equal((await tavernTaskBoardsTable.get(session.id))?.listings.length, 6);
     assert.equal(await tavernTaskVersionsTable.where('sessionId').equals(session.id).count(), 1);
     assert.equal(await tavernEconomyTransactionsTable.where('sessionId').equals(session.id).count(), 2);
@@ -786,6 +815,42 @@ test('accepting a listing atomically locks world money without mutating the boar
         actionId: 'second-action',
         taskId: 'second-task',
     }), /task_listing_already_accepted/);
+});
+
+test('task progress stores a bounded objective state instead of an unbounded turn recap', async () => {
+    await db.delete();
+    await db.open();
+    const session = await createTavernSession({ title: 'Bounded task progress' });
+    const board = await replaceTavernTaskBoard({
+        sessionId: session.id,
+        expectedRevision: 0,
+        anchorOrder: 1,
+        generationId: 'bounded-progress-board',
+        listings: boardListings(),
+    });
+    const accepted = await acceptTavernTaskListing({
+        sessionId: session.id,
+        boardId: board.generationId,
+        boardRevision: board.revision,
+        listingId: board.listings[0].id,
+        anchorOrder: 1,
+        actionId: 'bounded-progress-accept',
+        taskId: 'bounded-progress-task',
+    });
+    const verboseSummary = '已确认一条目标事实🙂'.repeat(30);
+    const progress = await progressTavernTask({
+        sessionId: session.id,
+        taskId: accepted.taskId,
+        expectedRevision: accepted.revision,
+        progressSummary: verboseSummary,
+        anchorOrder: 2,
+        actionId: 'bounded-progress-update',
+    });
+    assert.equal([...progress.progressSummary].length, TAVERN_TASK_PROGRESS_SUMMARY_MAX_LENGTH);
+    assert.equal(
+        progress.progressSummary,
+        [...verboseSummary].slice(0, TAVERN_TASK_PROGRESS_SUMMARY_MAX_LENGTH).join(''),
+    );
 });
 
 test('accepting before the board boundary fails without creating task or wallet facts', async () => {
@@ -1035,7 +1100,7 @@ test('task action replays cannot cross mutation transitions', async () => {
     }), /task_action_conflict/);
 });
 
-test('task cancellation and failure return escrow to the correct issuer', async () => {
+test('task cancellation and failure return escrow to the correct funding source', async () => {
     await db.delete();
     await db.open();
 
@@ -1127,7 +1192,10 @@ test('task cancellation and failure return escrow to the correct issuer', async 
     });
     assert.equal(failedAccepted.status, 'failed');
     assert.equal(await getTavernTaskPlayerBalance(acceptedSession.id), 100);
-    assert.equal((await tavernEconomyAccountsTable.get([acceptedSession.id, 'counterparty:issuer-1']))?.balance, 0);
+    assert.equal((await tavernEconomyAccountsTable.get([
+        acceptedSession.id,
+        buildTavernTaskCounterpartyAccountId(accepted.issuer.id),
+    ]))?.balance, 0);
     assert.equal((await tavernEconomyAccountsTable.get([acceptedSession.id, accepted.escrowAccountId]))?.balance, 0);
 });
 
@@ -1201,7 +1269,7 @@ test('staged maintenance writes nothing until commit and stale anchor state fail
     assert.equal(await getTavernTaskPlayerBalance(session.id), 100);
     await commitTavernTaskStagingContext(context);
     assert.equal((await getCurrentTavernTask(session.id, accepted.taskId))?.status, 'completed');
-    assert.equal(await getTavernTaskPlayerBalance(session.id), 110);
+    assert.equal(await getTavernTaskPlayerBalance(session.id), 250);
 
     const staleContext = await createTavernTaskStagingContext(session.id, 1);
     const staleTask = staleContext.projected.get(accepted.taskId);
@@ -1271,7 +1339,7 @@ test('delayed staged settlement keeps its evidence floor across newer wallet act
     assert.equal(completedTask?.anchorOrder, 2);
     assert.equal(settlement?.anchorOrder, 2);
     assert.ok(Number(settlement?.ledgerOrder) > laterSpend.ledgerOrder);
-    assert.equal(await getTavernTaskPlayerBalance(session.id), 105);
+    assert.equal(await getTavernTaskPlayerBalance(session.id), 245);
 
     await assert.rejects(postTavernEconomyTransaction({
         sessionId: session.id,
@@ -1301,9 +1369,9 @@ test('delayed staged settlement keeps its evidence floor across newer wallet act
     const retainedSettlement = settlement
         ? await tavernEconomyTransactionsTable.get([session.id, settlement.id])
         : undefined;
-    assert.equal(retainedSettlement?.playerBalanceAfter, 110);
+    assert.equal(retainedSettlement?.playerBalanceAfter, 250);
     assert.equal((await getCurrentTavernTask(session.id, accepted.taskId))?.status, 'completed');
-    assert.equal(await getTavernTaskPlayerBalance(session.id), 110);
+    assert.equal(await getTavernTaskPlayerBalance(session.id), 250);
 });
 
 test('task and economy rollback share one floor and restore current markers', async () => {
@@ -1354,6 +1422,6 @@ test('task and economy rollback share one floor and restore current markers', as
     assert.equal(current?.status, 'active');
     assert.equal(current?.currentMarker, 'current');
     assert.equal(await getTavernTaskPlayerBalance(session.id), 100);
-    assert.equal((await tavernEconomyAccountsTable.get([session.id, active.escrowAccountId]))?.balance, 25);
+    assert.equal((await tavernEconomyAccountsTable.get([session.id, active.escrowAccountId]))?.balance, 60);
     assert.equal((await tavernEconomyAccountsTable.get([session.id, TAVERN_PLAYER_ACCOUNT_ID]))?.balance, 100);
 });

@@ -5,6 +5,8 @@ import db, {
     tavernBankStateVersionsTable,
     tavernEconomyAccountsTable,
     tavernEconomyTransactionsTable,
+    tavernPetActionsTable,
+    tavernPetCompanionTable,
     tavernSessionsTable,
     tavernShopStateVersionsTable,
     tavernTaskBoardsTable,
@@ -16,6 +18,10 @@ import {
     TAVERN_BANK_CURRENT_MARKER,
     type TavernBankStateVersionRecord,
 } from '../../../shared/bank/bank-types';
+import {
+    TAVERN_PET_COMPANION_ID,
+    type TavernPetActionRecord,
+} from '../../../shared/pet/pet-types';
 
 interface TavernPhoneDomainSyncOptions {
     selectedSessionId: Ref<string>;
@@ -23,11 +29,16 @@ interface TavernPhoneDomainSyncOptions {
     onEconomyChanged: () => void | Promise<void>;
     onShopChanged: () => void | Promise<void>;
     onBankChanged: (change: TavernBankDomainChange) => void | Promise<void>;
+    onPetChanged: (change: TavernPetDomainChange) => void | Promise<void>;
 }
 
 export interface TavernBankDomainChange {
     sessionId: string;
     settledPositionIds: string[];
+}
+
+export interface TavernPetDomainChange {
+    journalIds: string[];
 }
 
 interface DexieLiveQuerySubscription {
@@ -64,6 +75,17 @@ interface BankVersionRangeTable {
             includeLower?: boolean,
             includeUpper?: boolean,
         ): { toArray(): Promise<TavernBankStateVersionRecord[]> };
+    };
+}
+
+interface TavernPetActionRevisionRangeTable {
+    where(index: string): {
+        between(
+            lower: unknown,
+            upper: unknown,
+            includeLower?: boolean,
+            includeUpper?: boolean,
+        ): { toArray(): Promise<TavernPetActionRecord[]> };
     };
 }
 
@@ -165,6 +187,32 @@ async function bankDomainFingerprint(sessionId: string): Promise<TavernBankDomai
     });
 }
 
+interface TavernPetDomainSnapshot {
+    fingerprint: string;
+    revision: number;
+    versionId: string;
+}
+
+async function petDomainFingerprint(): Promise<TavernPetDomainSnapshot> {
+    return await db.transaction(
+        'r',
+        tavernPetCompanionTable,
+        async () => {
+            const current = await tavernPetCompanionTable.get(TAVERN_PET_COMPANION_ID);
+            const revision = Number(current?.revision) || 0;
+            const versionId = current?.versionId || '';
+            return {
+                fingerprint: JSON.stringify([
+                    revision,
+                    versionId,
+                ]),
+                revision,
+                versionId,
+            };
+        },
+    );
+}
+
 async function bankSettledPositionIdsBetween(input: {
     sessionId: string;
     previousRevision: number;
@@ -188,6 +236,27 @@ async function bankSettledPositionIdsBetween(input: {
             )
             .toArray();
         return [...new Set(rows.flatMap((row) => row.action.settledPositionIds || []))];
+    });
+}
+
+async function petJournalIdsBetween(input: {
+    previousRevision: number;
+    nextRevision: number;
+}): Promise<string[]> {
+    if (input.nextRevision <= input.previousRevision) {return [];}
+    if (input.previousRevision === 0 && input.nextRevision !== 1) {return [];}
+    return await db.transaction('r', tavernPetActionsTable, async () => {
+        const ordered = await (tavernPetActionsTable as unknown as TavernPetActionRevisionRangeTable)
+            .where('revision')
+            .between(input.previousRevision + 1, input.nextRevision, true, true)
+            .toArray();
+        const expectedCount = input.nextRevision - input.previousRevision;
+        if (ordered.length !== expectedCount
+            || ordered.some((row, index) => row.revision !== input.previousRevision + index + 1)
+        ) {
+            return [];
+        }
+        return [...new Set(ordered.flatMap((row) => row.activityId ? [row.activityId] : []))];
     });
 }
 
@@ -254,6 +323,38 @@ function createBankRefreshScheduler(
     };
 }
 
+function createPetRefreshScheduler(
+    callback: (change: TavernPetDomainChange) => void | Promise<void>,
+) {
+    let running = false;
+    let requested = false;
+    const pendingJournalIds = new Set<string>();
+    return (change: TavernPetDomainChange) => {
+        change.journalIds.forEach((journalId) => pendingJournalIds.add(journalId));
+        requested = true;
+        if (running) {return;}
+        running = true;
+        void (async () => {
+            try {
+                while (requested) {
+                    requested = false;
+                    const next: TavernPetDomainChange = {
+                        journalIds: [...pendingJournalIds],
+                    };
+                    pendingJournalIds.clear();
+                    try {
+                        await callback(next);
+                    } catch (error) {
+                        console.warn('[LittleWhiteBox/tavern] Pet domain refresh failed', error);
+                    }
+                }
+            } finally {
+                running = false;
+            }
+        })();
+    };
+}
+
 export function useTavernPhoneDomainSync(options: TavernPhoneDomainSyncOptions): void {
     let subscriptions: DexieLiveQuerySubscription[] = [];
     let generation = 0;
@@ -261,6 +362,7 @@ export function useTavernPhoneDomainSync(options: TavernPhoneDomainSyncOptions):
     const scheduleEconomyRefresh = createRefreshScheduler('Economy', options.onEconomyChanged);
     const scheduleShopRefresh = createRefreshScheduler('Shop', options.onShopChanged);
     const scheduleBankRefresh = createBankRefreshScheduler(options.onBankChanged);
+    const schedulePetRefresh = createPetRefreshScheduler(options.onPetChanged);
 
     function stopSubscriptions(): void {
         generation += 1;
@@ -277,7 +379,9 @@ export function useTavernPhoneDomainSync(options: TavernPhoneDomainSyncOptions):
         let economyFingerprint: string | null = null;
         let shopFingerprint: string | null = null;
         let bankSnapshot: TavernBankDomainSnapshot | null = null;
+        let petSnapshot: TavernPetDomainSnapshot | null = null;
         let bankChangeQueue = Promise.resolve();
+        let petChangeQueue = Promise.resolve();
         subscriptions = [
             runLiveQuery(() => taskDomainFingerprint(sessionId)).subscribe({
                 next: (nextFingerprint) => {
@@ -340,6 +444,27 @@ export function useTavernPhoneDomainSync(options: TavernPhoneDomainSyncOptions):
                         });
                 },
                 error: (error) => console.warn('[LittleWhiteBox/tavern] Bank domain sync failed', error),
+            }),
+            runLiveQuery(() => petDomainFingerprint()).subscribe({
+                next: (nextSnapshot) => {
+                    if (currentGeneration !== generation) {return;}
+                    const previousSnapshot = petSnapshot;
+                    petSnapshot = nextSnapshot;
+                    if (!previousSnapshot || nextSnapshot.fingerprint === previousSnapshot.fingerprint) {return;}
+                    petChangeQueue = petChangeQueue
+                        .then(async () => {
+                            const journalIds = await petJournalIdsBetween({
+                                previousRevision: previousSnapshot.revision,
+                                nextRevision: nextSnapshot.revision,
+                            });
+                            if (currentGeneration !== generation) {return;}
+                            schedulePetRefresh({ journalIds });
+                        })
+                        .catch((error) => {
+                            console.warn('[LittleWhiteBox/tavern] Pet journal sync failed', error);
+                        });
+                },
+                error: (error) => console.warn('[LittleWhiteBox/tavern] Pet domain sync failed', error),
             }),
         ];
     }
